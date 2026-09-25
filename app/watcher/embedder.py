@@ -32,9 +32,11 @@ class OllamaEmbedder:
         timeout: float = 120.0,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        keep_alive: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.keep_alive = keep_alive  # how long Ollama keeps the model loaded after a request, e.g. "1h"
         self.batch_size = batch_size
         self.retries = retries
         self.backoff_seconds = backoff_seconds
@@ -64,7 +66,10 @@ class OllamaEmbedder:
         last_error: Exception | None = None
         for attempt in range(1, self.retries + 1):
             try:
-                r = self._client.post("/api/embed", json={"model": self.model, "input": batch})
+                payload: dict = {"model": self.model, "input": batch}
+                if self.keep_alive:
+                    payload["keep_alive"] = self.keep_alive
+                r = self._client.post("/api/embed", json=payload)
             except httpx.TransportError as e:  # connection refused, timeout, ...
                 last_error = e
             else:

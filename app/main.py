@@ -2,7 +2,7 @@ from fastapi import Depends, FastAPI
 
 from app import __version__
 from app.auth import require_api_key
-from app.routers import contacts, habits, health, notes, pantry, schedule
+from app.routers import contacts, context, habits, health, knowledge, notes, pantry, schedule
 
 app = FastAPI(
     title="Personal Unified API",
@@ -11,5 +11,5 @@ app = FastAPI(
 )
 
 app.include_router(health.router)
-for module in (pantry, schedule, habits, contacts, notes):
+for module in (pantry, schedule, habits, contacts, notes, knowledge, context):
     app.include_router(module.router, dependencies=[Depends(require_api_key)])
