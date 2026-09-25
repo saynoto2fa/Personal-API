@@ -21,6 +21,8 @@ Obsidian vault ──► file watcher ──► Postgres + pgvector ◄── Fa
 
 Each stage works on its own. The CRUD APIs work without pgvector, Ollama or the watcher; the watcher needs pgvector and a local Ollama.
 
+**Something not working?** See [docs/troubleshooting.md](docs/troubleshooting.md): symptoms, causes and fixes for every problem hit so far. It's also indexed by the watcher, so assistants can find it with `search_knowledge`.
+
 ## Repo layout
 
 ```
