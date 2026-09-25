@@ -6,12 +6,16 @@ from app.models.knowledge import EMBED_DIM
 from app.watcher.embedder import EmbeddingError
 
 VOCAB = ["tomato", "garden", "soil", "python", "database", "query", "recipe", "pasta", "budget", "invoice"]
+# Words the fake "understands" as meaning a VOCAB word, so a query can match by meaning without
+# sharing a single word with the document (what full-text search can't do).
+SYNONYMS = {"vegetables": "tomato", "vegetable": "tomato", "growing": "garden", "coding": "python", "money": "budget"}
 
 
 class KeywordEmbedder:
-    """Bag-of-keywords vectors: texts sharing words from VOCAB have high cosine similarity.
+    """Bag-of-keywords vectors: texts sharing words (or SYNONYMS) from VOCAB have high cosine similarity.
 
-    Records every text it embeds, so tests can check the prefixes used.
+    Words outside VOCAB, like identifiers or error codes, are invisible to it, as rare exact terms
+    tend to be to a real embedding model. Records every text it embeds, so tests can check prefixes.
     """
 
     model = "fake-keyword"
@@ -26,7 +30,7 @@ class KeywordEmbedder:
         self.texts.extend(texts)
         vectors = []
         for t in texts:
-            words = re.findall(r"[a-z]+", t.lower())
+            words = [SYNONYMS.get(w, w) for w in re.findall(r"[a-z]+", t.lower())]
             v = [0.0] * EMBED_DIM
             v[0] = 0.05  # small shared component so no vector is all zeros
             for i, term in enumerate(VOCAB, start=1):

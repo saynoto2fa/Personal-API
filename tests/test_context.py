@@ -140,6 +140,47 @@ def test_context_still_answers_when_ollama_is_down(client, fake_embedder):  # no
     r = client.get("/me/context", params={"q": "anything"})
     assert r.status_code == 200
     ctx = r.json()
-    assert ctx["knowledge"] == []
-    assert len(ctx["warnings"]) == 1 and ctx["warnings"][0].startswith("knowledge: search unavailable")
+    assert ctx["knowledge"] == []  # hybrid fell back to keyword-only; nothing indexed here
+    assert len(ctx["warnings"]) == 1 and ctx["warnings"][0].startswith("knowledge: semantic search unavailable")
     assert ctx["summary"]["pantry_total"] == 0
+
+
+def test_topic_filters_scope_detail_sections_but_not_the_summary(client, fake_embedder):  # noqa: F811
+    now = datetime.now(UTC)
+    today = date.today()
+    for title, category in [("Standup", "Work"), ("Dentist", "health"), ("Review", "work"), ("Dinner", None)]:
+        body = {"title": title, "starts_at": _iso(now + timedelta(hours=len(title))), "category": category}
+        assert client.post("/schedule", json={k: v for k, v in body.items() if v}).status_code == 201
+    soon = str(today + timedelta(days=2))
+    for name, tags, location in [
+        ("GF bread", ["gluten_free", "pork_free"], "freezer"),
+        ("Bacon", ["gluten_free", "contains_pork"], "fridge"),
+        ("Pasta", ["contains_gluten"], "pantry"),
+        ("Yogurt", ["gluten_free"], "fridge"),
+    ]:
+        item = {"name": name, "dietary_tags": tags, "location": location, "expiry_estimate": soon}
+        assert client.post("/pantry", json=item).status_code == 201
+
+    r = client.get("/me/context", params={"schedule_category": "WORK"})
+    assert r.status_code == 200, r.text
+    ctx = r.json()
+    assert ctx["include"] == ["schedule"]  # the filter brings its section
+    assert ctx["filters"] == {"schedule_category": "WORK"}
+    assert [e["title"] for e in ctx["schedule"]] == ["Review", "Standup"]  # sorted by start time
+    assert ctx["pantry"] is None
+    assert ctx["summary"]["schedule_count_upcoming"] == 4  # the summary is never filtered
+
+    # "Safe for everyone": gluten-free and no pork, same semantics as GET /pantry?tag=&exclude_tag=
+    ctx = client.get("/me/context", params={"pantry_tag": "Gluten-Free", "pantry_exclude_tag": "contains_pork"}).json()
+    assert ctx["include"] == ["pantry"]
+    assert ctx["filters"] == {"pantry_tag": ["gluten_free"], "pantry_exclude_tag": ["contains_pork"]}
+    assert [i["name"] for i in ctx["pantry"]["expiring"]] == ["GF bread", "Yogurt"]
+    assert ctx["pantry"]["total_items"] == 2
+    assert ctx["summary"]["pantry_total"] == 4
+
+    ctx = client.get("/me/context", params={"pantry_location": "Fridge", "include": "habits"}).json()
+    assert ctx["include"] == ["pantry", "habits"]
+    assert [i["name"] for i in ctx["pantry"]["expiring"]] == ["Bacon", "Yogurt"]
+
+    plain = client.get("/me/context").json()  # the lean default is unchanged
+    assert plain["include"] == [] and plain["filters"] == {} and plain["schedule"] is None and plain["pantry"] is None

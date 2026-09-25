@@ -66,6 +66,10 @@ class MeContext(BaseModel):
     q: str | None = Field(description="Topic used for the knowledge section, if any")
     days: int = Field(description="Look-ahead window used for schedule and expiring pantry items")
     include: list[str] = Field(description="Sections returned in full detail")
+    filters: dict = Field(
+        default_factory=dict,
+        description="Topic filters applied to detail sections (schedule_category, pantry_tag, ...); the summary ignores them",
+    )
     summary: ContextSummary
     schedule: list[ContextEvent] | None = Field(None, description="Only with include=schedule")
     pantry: PantrySummary | None = Field(None, description="Only with include=pantry")

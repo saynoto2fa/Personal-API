@@ -30,6 +30,7 @@ migrations/                 SQL migrations, applied in order by app/migrate.py
   0001_core_schema.sql      pantry_items, schedule, habits, habit_checkins, contacts, notes
   0002_knowledge_vectors.sql  documents + chunks (vector(768)), needs pgvector
   0003_archive_entries.sql  retention clock for the OUTDATED folder
+  0004_chunks_fulltext.sql  generated tsvector + GIN index on chunks, for keyword/hybrid search
 app/
   main.py                   FastAPI app
   config.py                 settings from env / .env
@@ -257,7 +258,13 @@ The first run embeds every file. For this vault that was 71 notes → 938 chunks
 
 - **Files:** `.md` files under each source folder. It skips `.obsidian`, `.git`, `.trash`, `node_modules`, `.venv`/`venv`, `__pycache__`, and the archive folder (`OUTDATED` by default; see below).
 - **One at a time:** only one watcher runs at once. A second one sees the lock in `logs/watcher.lock` and exits.
-- **Chunking:** about 500 tokens per chunk (estimated as 4 characters per token). Paragraphs, lists and fenced code blocks stay whole unless one is bigger than a chunk. A heading starts a new chunk once the current one has at least ~100 tokens. Chunks within a long section overlap by ~50 tokens; chunks never overlap across sections. YAML frontmatter is left out of chunks but used for the title.
+- **Chunking:**
+  - **Size:** about 500 tokens per chunk (estimated as 4 characters per token). Paragraphs, lists and fenced code blocks stay whole unless one is bigger than a chunk.
+  - **Top-level sections:** H1 and H2 headings always start a new chunk, however short the section, so each gets its own correctly labeled chunk. A lone `# Title` line stays with its first section instead of becoming a chunk of its own.
+  - **Subsections:** H3 and deeper start a new chunk only once the current chunk has ~100 tokens, so short subsections merge with the next one. A merged chunk is labeled with the section that contributes most of its text.
+  - **Overlap:** chunks within a long section overlap by ~50 tokens; chunks never overlap across sections.
+  - **Frontmatter:** YAML frontmatter is left out of chunks but used for the title.
+  - **Chunker version:** documents record the chunker version that produced them (`documents.metadata.chunker`). When `CHUNKER_VERSION` in `app/watcher/chunker.py` is bumped, the next sync re-chunks and re-embeds every file once. Version 2 is the heading rule above; re-chunking the whole vault takes about 75 seconds.
 - **Traceability:** each chunk's `metadata` holds `heading_path`, `start_line` and `end_line`, with line numbers from the original file. `documents.path` is relative to the source folder, and `chunks.token_count` is the estimate.
 - **Embedding:** each chunk is embedded as `search_document: <title> > <headings>` followed by the chunk text, 16 chunks per Ollama request.
 - **Edits:** a new version of a file is embedded first. The document row and all of its chunks are then replaced in one transaction, so no stale chunks are left behind, and a failure keeps the previous version. A file whose content hash and model are unchanged is skipped.
@@ -306,8 +313,26 @@ Both endpoints are read-only, need `X-API-Key`, and embed the query with the loc
 | `q` | required: what to look for, in plain language (1–1000 characters, not blank) |
 | `limit` | results to return (default 10, max 50) |
 | `source` | only search one source, e.g. `vault` (matches `documents.source`) |
+| `mode` | `hybrid` (default), `semantic` or `keyword` |
 
-Results are ranked by cosine similarity (`<=>` on `chunks.embedding`, HNSW `vector_cosine_ops` index), best first. `score` is `1 - cosine distance`; on this vault a strong match is about 0.7–0.8. Each hit points back to its file and lines. Notes in `OUTDATED` are never returned, because they aren't indexed.
+**Search modes:**
+
+| Mode | How it works | Good for |
+|---|---|---|
+| `semantic` | cosine similarity between the query embedding and chunk embeddings (`<=>`, HNSW `vector_cosine_ops` index) | topics and questions, even when worded differently from the note |
+| `keyword` | Postgres full-text search on `chunks.content_tsv` (GIN index, `websearch_to_tsquery`: plain words, `"quoted phrases"`, `-exclude`, `or`). Words in a chunk's headings weigh more than body text. | exact names, error messages, codes and identifiers, which embeddings blur. **Works without Ollama.** |
+| `hybrid` | runs both and merges them with **reciprocal rank fusion** (below) | the default: works for both kinds of query |
+
+**Why reciprocal rank fusion (RRF):**
+- **How it scores:** each result earns `1 / (60 + its rank)` from each method, and the two are added.
+- **Why not add raw scores:** cosine similarity sits around 0.5–0.8 while full-text rank is small and unbounded. Mixing them would need weights tuned to this vault, and those weights would drift as notes change. RRF uses ranks only, needs no tuning, and puts results both methods agree on at the top.
+- **Ties** go to results that contain the query's exact words. For a query like an error code, the nearest embedding can be an unrelated note, while an exact match is strong evidence.
+
+**Fields on each hit:**
+- **`score`:** the ranking score for the mode used (RRF, cosine or full-text rank). Only compare it within one response.
+- **`semantic_score`:** cosine similarity (~0.7+ is strong on this vault).
+- **`keyword_score`:** full-text rank, or `null` when the chunk doesn't contain the query's words.
+- **Location:** each hit points back to its file and lines. Notes in `OUTDATED` are never returned, because they aren't indexed.
 
 ```bash
 curl -H "X-API-Key: $API_KEY" 'localhost:8000/knowledge/search?q=windows%20process%20auditing&limit=2'
@@ -315,10 +340,13 @@ curl -H "X-API-Key: $API_KEY" 'localhost:8000/knowledge/search?q=windows%20proce
 ```json
 {
   "query": "windows process auditing",
+  "mode": "hybrid",
   "source": null,
   "results": [
     {
-      "score": 0.789,
+      "score": 0.032787,
+      "semantic_score": 0.789,
+      "keyword_score": 0.3,
       "source": "vault",
       "path": "Windows-Process-Auditor.md",
       "title": "Windows Background Process Auditor",
@@ -328,12 +356,15 @@ curl -H "X-API-Key: $API_KEY" 'localhost:8000/knowledge/search?q=windows%20proce
       "end_line": 7,
       "content": "# Windows Background Process Auditor\n\n..."
     },
-    { "score": 0.772, "path": "Windows-Process-Auditor.md", "heading_path": ["Windows Background Process Auditor", "Steps"], "start_line": 9, "end_line": 31, "...": "..." }
-  ]
+    { "score": 0.032258, "semantic_score": 0.772, "path": "Windows-Process-Auditor.md", "heading_path": ["Windows Background Process Auditor", "Steps"], "...": "..." }
+  ],
+  "warnings": []
 }
 ```
 
-Errors: `422` for a missing, blank or too-long `q` or an out-of-range `limit`; `503` if Ollama can't embed the query (not running, or model not pulled).
+**Errors and fallbacks:**
+- **`422`:** a missing, blank or too-long `q`, an out-of-range `limit`, or an unknown `mode`.
+- **Ollama down (not running, or model not pulled):** `mode=semantic` returns `503`. `mode=hybrid` still answers with keyword results only, plus a `warnings` entry. `mode=keyword` never needs Ollama.
 
 ### `GET /me/context`
 
@@ -346,15 +377,25 @@ A fast snapshot of what's going on, for assistants to read at the start of a con
 | `days` | look-ahead window for schedule and expiring pantry items (default 7, max 31) |
 | `knowledge_limit` | notes to include for `q` (default 5, max 20) |
 | `source` | only search notes in this source |
+| `schedule_category` | scope the schedule section to one category, e.g. `work` (as `GET /schedule?category=`) |
+| `pantry_tag`, `pantry_exclude_tag` | scope the pantry section to items with **all** / **none** of these tags, repeatable (as `GET /pantry?tag=&exclude_tag=`) |
+| `pantry_location` | scope the pantry section to one location, e.g. `fridge` (as `GET /pantry?location=`) |
+
+**Topic filters:**
+- **Reuse:** they are the list endpoints' own filters, not new ones.
+- **They bring their section:** passing one adds its section automatically, the same way `q` adds `knowledge`. For example, `?pantry_tag=gluten_free&pantry_exclude_tag=contains_pork` returns the pantry section limited to food that's safe for everyone.
+- **The summary is never filtered,** so the lean default stays a true baseline. The response's `filters` field echoes what was applied.
+- **Habits** have no tags or categories to filter on.
 
 | Key | Returned | Contents (capped) |
 |---|---|---|
-| `summary` | always | `schedule_count_today`, `schedule_count_upcoming`, `next_event`, `pantry_total`, `pantry_out_of_stock`, `pantry_expiring_count`, `habits_active`, `habits_done_today`, `habits_done_this_week` |
-| `schedule` | `include=schedule` | events not yet over and starting within `days`, soonest first (max 20). All-day events without an end count as lasting that day. |
-| `pantry` | `include=pantry` | `total_items`, `out_of_stock`, and `expiring`: in-stock items expiring within `days`, including already-expired ones (max 15) |
+| `summary` | always | `schedule_count_today`, `schedule_count_upcoming`, `next_event`, `pantry_total`, `pantry_out_of_stock`, `pantry_expiring_count`, `habits_active`, `habits_done_today`, `habits_done_this_week`. Never filtered. |
+| `schedule` | `include=schedule` or `schedule_category` | events not yet over and starting within `days`, soonest first (max 20). All-day events without an end count as lasting that day. |
+| `pantry` | `include=pantry` or a `pantry_*` filter | `total_items`, `out_of_stock`, and `expiring`: in-stock items expiring within `days`, including already-expired ones (max 15). All three respect the pantry filters. |
 | `habits` | `include=habits` | active habits with `done_this_week` (check-ins marked done since Monday) and `done_today` (max 30) |
-| `knowledge` | when `q` is given | the same hits as `/knowledge/search`, for `q` |
-| `warnings` | always | sections that couldn't be filled. If Ollama is down, the rest is still returned, with a warning instead of a 503. |
+| `knowledge` | when `q` is given | the same hits as `/knowledge/search` in hybrid mode, for `q` |
+| `filters` | always | the topic filters applied, e.g. `{"pantry_tag": ["gluten_free"]}` |
+| `warnings` | always | anything that couldn't be filled. If Ollama is down, knowledge falls back to keyword matches and says so here. |
 
 Sections that weren't requested are `null`. `include` lists what was actually returned in full.
 
@@ -430,8 +471,8 @@ Every tool starts with a marker saying whether it changes data. Read tools begin
 
 | Tool | Calls | What it's for |
 |---|---|---|
-| `search_knowledge` | `GET /knowledge/search` | find passages in the vault **by meaning**, with file path and line numbers |
-| `get_context` | `GET /me/context` | quick situational summary. The default is lightweight counts; pass `include` or `q` for detail. |
+| `search_knowledge` | `GET /knowledge/search` | find passages in the vault and docs. The default is **hybrid**, by meaning and exact words; `mode` can be `semantic` or `keyword`. Returns file path and line numbers. |
+| `get_context` | `GET /me/context` | quick situational summary. The default is lightweight counts; pass `include`, `q`, or topic filters (`schedule_category`, `pantry_tag`, `pantry_exclude_tag`, `pantry_location`) for detail. |
 | `list_pantry`, `get_pantry_item` | `GET /pantry`, `/pantry/{id}` | inventory, with dietary-tag, expiry and stock filters |
 | `create_pantry_item`, `update_pantry_item`, `delete_pantry_item` | `POST`/`PATCH`/`DELETE /pantry` | change inventory |
 | `adjust_pantry_quantity` | `POST /pantry/{id}/adjust` | "used 2", "bought 3 more" |

@@ -27,17 +27,49 @@ def test_empty_and_whitespace_docs_have_no_chunks():
     assert chunk_markdown("---\ntitle: only frontmatter\n---\n").chunks == []
 
 
-def test_small_sections_merge_but_substantial_sections_split():
-    small = "# A\n\nshort.\n\n## B\n\nalso short."
-    (chunk,) = chunk_markdown(small).chunks
-    assert chunk.heading_path == ["A"]
-
+def test_h1_h2_always_split_even_when_short():
     body = _para(150)  # ~190 tokens, above MIN_SECTION_TOKENS
     doc = f"# A\n\n{body}\n\n## B\n\n{body}\n\n# C\n\n{body}"
     chunks = chunk_markdown(doc).chunks
     assert [c.heading_path for c in chunks] == [["A"], ["A", "B"], ["C"]]
     assert chunks[1].content.startswith("## B")
     assert [c.index for c in chunks] == [0, 1, 2]
+
+    small = "# A\n\nshort.\n\n## B\n\nalso short."
+    chunks = chunk_markdown(small).chunks
+    assert [(c.heading_path, c.content) for c in chunks] == [(["A"], "# A\n\nshort."), (["A", "B"], "## B\n\nalso short.")]
+
+
+def test_short_entries_in_a_troubleshooting_doc_keep_their_own_labels():
+    # The bug this fixes: a short "## One" merged into "## Two" and the hit was labeled "One".
+    doc = (
+        "# Troubleshooting\n\nIntro.\n\n"
+        "## Slow first search\n\nOllama unloads the model after 5 minutes.\n\n"
+        f"## Tools missing in Claude Desktop\n\n{_para(120, 'config')}\n\n"
+        "## Tiny\n\nOne line."
+    )
+    chunks = chunk_markdown(doc).chunks
+    assert [c.heading_path[-1] for c in chunks] == ["Troubleshooting", "Slow first search", "Tools missing in Claude Desktop", "Tiny"]
+    desktop = chunks[2]
+    assert desktop.content.startswith("## Tools missing") and "Ollama" not in desktop.content
+
+
+def test_title_line_joins_first_section_and_takes_its_label():
+    chunks = chunk_markdown("# Guide\n\n## Setup\n\nInstall it.\n\n## Use\n\nRun it.").chunks
+    assert [c.heading_path for c in chunks] == [["Guide", "Setup"], ["Guide", "Use"]]
+    assert chunks[0].content == "# Guide\n\n## Setup\n\nInstall it."  # no heading-only chunk
+
+
+def test_short_subsections_merge_and_are_labeled_by_the_dominant_one():
+    doc = f"# G\n\n## Setup\n\n### Prereqs\n\nPython.\n\n### Install\n\n{_para(30, 'install')}\n\n### Check\n\nRun it."
+    (chunk,) = chunk_markdown(doc).chunks  # H3 sections under 100 tokens merge together
+    assert chunk.heading_path == ["G", "Setup", "Install"]  # the section with most of the text
+    assert "### Prereqs" in chunk.content and "### Check" in chunk.content
+    assert chunk.start_line == 1
+
+    big = _para(150, "big")
+    chunks = chunk_markdown(f"## S\n\n### One\n\n{big}\n\n### Two\n\nsmall").chunks
+    assert [c.heading_path for c in chunks] == [["S", "One"], ["S", "Two"]]  # substantial H3 still splits
 
 
 def test_long_section_splits_near_target_with_overlap():

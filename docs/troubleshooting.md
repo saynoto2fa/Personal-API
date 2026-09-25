@@ -18,13 +18,36 @@ Quick health check, in order:
 
 ## Search returns nothing, or "knowledge: search unavailable", after a reboot
 
-- **Symptom:** `search_knowledge` returns a 503, or `get_context` has the warning
-  `knowledge: search unavailable (Ollama ... actively refused it)`. Everything else works.
+- **Symptom:** search results carry the warning `semantic search unavailable (...); showing
+  keyword matches only`, `mode=semantic` returns a 503, or `get_context` has a `knowledge:` warning
+  mentioning Ollama "actively refused it". Keyword matches and everything else still work.
 - **Cause:** Ollama isn't running. Its startup entry had been disabled, so it didn't start at login.
 - **Fix:** start it with `& "$env:LOCALAPPDATA\Programs\Ollama\ollama app.exe"`. To start it at login,
   put a shortcut to that exe in the Startup folder (`shell:startup`) and enable "Ollama" under
   Task Manager → Startup apps. Both were done on 2026-09-24.
 - **Check:** `Invoke-RestMethod http://localhost:11434/api/version` answers, and a search returns results.
+
+## Search misses an exact name, error code or identifier
+
+- **Symptom:** searching for something like `2147946720`, a tool name or an exact error message
+  returns vaguely related notes instead of the one that contains it.
+- **Cause:** embeddings capture meaning, not exact strings, so rare tokens barely register.
+  Before Stage 7, search was semantic-only.
+- **Fix:** use the default `mode=hybrid`, which adds full-text keyword matching and ranks exact
+  matches first on ties, or `mode=keyword` to see only chunks containing the words. Keyword search
+  follows web-search syntax: `"exact phrase"`, `-exclude`, `or`.
+- **Check:** in the results, `keyword_score` is not null for chunks that contain the words.
+
+## A search hit is labeled with the wrong section heading
+
+- **Symptom:** the right text comes back, but `heading_path` names a different, short section just
+  above it.
+- **Cause:** chunker v1 merged sections under ~100 tokens into the next one and labeled the merged
+  chunk with the first section. This was fixed in chunker v2 (Stage 7): H1/H2 always split, and a merged
+  chunk takes the heading of the section contributing most of its text.
+- **Fix:** nothing to do. Every document records its chunker version in `documents.metadata.chunker`,
+  and the watcher re-chunks older ones on its next sync. If labels still look stale, restart the
+  Watcher task and check `logs\watcher.log` for `indexed` lines.
 
 ## The first search after a while takes 5–7 seconds
 

@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, select
 
 from app.db import SessionLocal
 from app.models.knowledge import EMBED_DIM, Chunk, Document
+from app.watcher.chunker import CHUNKER_VERSION
 from app.watcher.indexer import Indexer, Source
 
 
@@ -88,6 +89,20 @@ def test_index_then_skip_unchanged(source, indexer, embedder):
     calls = embedder.calls
     assert indexer.reconcile(source, "notes/a.md") == "unchanged"
     assert embedder.calls == calls  # no re-embedding
+
+
+def test_new_chunker_version_reindexes_unchanged_files(source, indexer, embedder):
+    _write(source, "a.md", "# A\n\nshort.\n\n## B\n\nalso short.")
+    indexer.reconcile(source, "a.md")
+    assert _docs(source)["a.md"].meta["chunker"] == CHUNKER_VERSION
+    with SessionLocal() as s, s.begin():  # pretend it was indexed by the previous chunker
+        doc = s.scalars(select(Document).where(Document.source == source.name)).one()
+        doc.meta = {**doc.meta, "chunker": CHUNKER_VERSION - 1}
+    calls = embedder.calls
+    counts, _ = indexer.sync(source)
+    assert counts == {"indexed": 1}
+    assert embedder.calls == calls + 1
+    assert indexer.sync(source)[0] == {"unchanged": 1}
 
 
 def test_edit_replaces_chunks_without_orphans(source, indexer):

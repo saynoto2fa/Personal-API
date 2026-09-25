@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db import SessionLocal
 from app.models.knowledge import Chunk, Document
 from app.watcher.chunker import Chunk as TextChunk
-from app.watcher.chunker import chunk_markdown
+from app.watcher.chunker import CHUNKER_VERSION, chunk_markdown
 from app.watcher.embedder import DOC_PREFIX
 
 log = logging.getLogger(__name__)
@@ -75,23 +75,31 @@ class Indexer:
         self.embedder = embedder
         self._session = session_factory
 
+    def _current_version(self, digest: str) -> tuple:
+        return (digest, self.embedder.model, str(CHUNKER_VERSION))
+
     def _stored_versions(self, source: Source, subdir: str | None = None, rel: str | None = None) -> dict[str, tuple]:
-        """{path: (content_hash, embed_model)} for one file, one folder, or the whole source."""
-        stmt = select(Document.path, Document.content_hash, Document.meta["embed_model"].astext).where(
-            Document.source == source.name
-        )
+        """{path: (content_hash, embed_model, chunker_version)} for one file, one folder, or the whole source."""
+        stmt = select(
+            Document.path,
+            Document.content_hash,
+            Document.meta["embed_model"].astext,
+            Document.meta["chunker"].astext,
+        ).where(Document.source == source.name)
         if rel is not None:
             stmt = stmt.where(Document.path == rel)
         elif subdir:
             stmt = stmt.where(Document.path.startswith(f"{subdir}/", autoescape=True))
         with self._session() as s:
-            return {path: (digest, model) for path, digest, model in s.execute(stmt)}
+            return {path: (digest, model, chunker) for path, digest, model, chunker in s.execute(stmt)}
 
     def reconcile(self, source: Source, rel: str, stored: tuple | None | object = _LOOKUP) -> str:
         """Make the database match the file at `rel`: index it, skip it if unchanged, or remove it.
 
-        `stored` is the (content_hash, embed_model) already known for this file (None if not indexed);
-        by default it is looked up. Returns one of 'indexed', 'unchanged', 'removed', 'absent'.
+        `stored` is the (content_hash, embed_model, chunker_version) already known for this file (None
+        if not indexed); by default it is looked up. A file is re-indexed when any of the three changed,
+        so a new chunker version re-chunks existing documents on the next sync.
+        Returns one of 'indexed', 'unchanged', 'removed', 'absent'.
         """
         path = source.root / rel
         try:
@@ -103,7 +111,7 @@ class Indexer:
         digest = hashlib.sha256(data).hexdigest()
         if stored is _LOOKUP:
             stored = self._stored_versions(source, rel=rel).get(rel)
-        if stored == (digest, self.embedder.model):
+        if stored == self._current_version(digest):
             return "unchanged"
 
         parsed = chunk_markdown(data.decode("utf-8-sig", errors="replace"))
@@ -112,7 +120,7 @@ class Indexer:
         vectors = self.embedder.embed([embed_input(title, c) for c in parsed.chunks]) if parsed.chunks else []
 
         with self._session() as s, s.begin():
-            doc_meta = {"embed_model": self.embedder.model, "chunk_count": len(parsed.chunks)}
+            doc_meta = {"embed_model": self.embedder.model, "chunker": CHUNKER_VERSION, "chunk_count": len(parsed.chunks)}
             stmt = pg_insert(Document).values(
                 source=source.name, path=rel, title=title, content_hash=digest, mtime=mtime, metadata=doc_meta
             )
