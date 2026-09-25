@@ -16,7 +16,7 @@ Obsidian vault ──► file watcher ──► Postgres + pgvector ◄── Fa
 | 2 | CRUD endpoints for **schedule, habits, contacts, notes** | ✅ done (habit check-in endpoints still to come) |
 | 3 | File watcher (vault + project folders → chunks → embeddings in pgvector) | ✅ done (`python -m app.watcher`) |
 | 4 | `GET /knowledge/search?q=` and `GET /me/context` | ✅ done |
-| 5 | MCP server wrapping the API | planned |
+| 5 | MCP server wrapping the API | ✅ done (`python -m app.mcp_server`, stdio) |
 
 Each stage works on its own. The CRUD APIs work without pgvector, Ollama or the watcher; the watcher needs pgvector and a local Ollama.
 
@@ -35,6 +35,7 @@ app/
   migrate.py                migration runner (python -m app.migrate)
   serve.py                  run the API with file logging (used by auto-start)
   search.py                 semantic search over chunks (used by /knowledge/search and /me/context)
+  mcp_server.py             MCP tools wrapping the API (stdio; python -m app.mcp_server)
   models/  schemas/  routers/
   watcher/                  file watcher + embedding pipeline (python -m app.watcher)
     chunker.py              Markdown -> ~500-token chunks with heading path + line range
@@ -318,35 +319,53 @@ Errors: `422` for a missing, blank or too-long `q` or an out-of-range `limit`; `
 
 ### `GET /me/context`
 
-A small, fast snapshot of what's going on, for assistants to read at the start of a conversation. It is not an export; use the resource endpoints for full lists.
+A fast snapshot of what's going on, for assistants to read at the start of a conversation. **By default it returns summary counts only**, about 0.5 KB, plus notes about `q` if one is given. Ask for full detail per section with `include`. It is not an export; use the resource endpoints for complete lists.
 
 | Param | Meaning |
 |---|---|
-| `q` | optional topic. When given, the `knowledge` section holds the top matching notes; without it, `knowledge` is empty. |
+| `q` | optional topic. Adds the `knowledge` section with the top matching notes. |
+| `include` | comma-separated sections to return in full: `pantry`, `schedule`, `habits`, `knowledge`. `include=pantry,schedule,habits` gives the full response that was the default before the summary. `knowledge` requires `q`. |
 | `days` | look-ahead window for schedule and expiring pantry items (default 7, max 31) |
 | `knowledge_limit` | notes to include for `q` (default 5, max 20) |
 | `source` | only search notes in this source |
 
-| Section | Contents (capped) |
-|---|---|
-| `schedule` | events not yet over and starting within `days`, soonest first (max 20). All-day events without an end count as lasting that day. |
-| `pantry` | `total_items`, `out_of_stock`, and `expiring`: in-stock items expiring within `days`, including already-expired ones (max 15) |
-| `habits` | active habits with `done_this_week` (check-ins marked done since Monday) and `done_today` (max 30) |
-| `knowledge` | the same hits as `/knowledge/search`, for `q` |
-| `warnings` | sections that couldn't be filled. If Ollama is down, the rest of the snapshot is still returned, with a warning instead of a 503. |
+| Key | Returned | Contents (capped) |
+|---|---|---|
+| `summary` | always | `schedule_count_today`, `schedule_count_upcoming`, `next_event`, `pantry_total`, `pantry_out_of_stock`, `pantry_expiring_count`, `habits_active`, `habits_done_today`, `habits_done_this_week` |
+| `schedule` | `include=schedule` | events not yet over and starting within `days`, soonest first (max 20). All-day events without an end count as lasting that day. |
+| `pantry` | `include=pantry` | `total_items`, `out_of_stock`, and `expiring`: in-stock items expiring within `days`, including already-expired ones (max 15) |
+| `habits` | `include=habits` | active habits with `done_this_week` (check-ins marked done since Monday) and `done_today` (max 30) |
+| `knowledge` | when `q` is given | the same hits as `/knowledge/search`, for `q` |
+| `warnings` | always | sections that couldn't be filled. If Ollama is down, the rest is still returned, with a warning instead of a 503. |
+
+Sections that weren't requested are `null`. `include` lists what was actually returned in full.
 
 ```bash
-curl -H "X-API-Key: $API_KEY" 'localhost:8000/me/context?q=tutor%20course%20design&knowledge_limit=3'
+curl -H "X-API-Key: $API_KEY" 'localhost:8000/me/context'
 ```
 ```json
 {
-  "generated_at": "2026-09-25T03:40:12Z",
-  "today": "2026-09-24",
-  "q": "tutor course design",
-  "days": 7,
-  "schedule": [{ "id": "…", "title": "Dentist", "starts_at": "2026-09-26T15:00:00Z", "ends_at": "2026-09-26T16:00:00Z", "all_day": false, "location": null, "category": "health" }],
-  "pantry": { "total_items": 12, "out_of_stock": 1, "expiring": [{ "id": "…", "name": "Milk", "qty": 1.0, "unit": "l", "location": "fridge", "expiry_estimate": "2026-09-26" }] },
+  "generated_at": "2026-09-25T03:40:12Z", "today": "2026-09-24", "q": null, "days": 7, "include": [],
+  "summary": {
+    "schedule_count_today": 2, "schedule_count_upcoming": 5,
+    "next_event": { "id": "…", "title": "Dentist", "starts_at": "2026-09-25T15:00:00Z", "ends_at": "2026-09-25T16:00:00Z", "all_day": false, "location": null, "category": "health" },
+    "pantry_total": 12, "pantry_out_of_stock": 1, "pantry_expiring_count": 2,
+    "habits_active": 3, "habits_done_today": 1, "habits_done_this_week": 6
+  },
+  "schedule": null, "pantry": null, "habits": null, "knowledge": null, "warnings": []
+}
+```
+
+```bash
+curl -H "X-API-Key: $API_KEY" 'localhost:8000/me/context?q=tutor%20course%20design&include=schedule,habits&knowledge_limit=3'
+```
+```json
+{
+  "q": "tutor course design", "include": ["schedule", "habits", "knowledge"],
+  "summary": { "...": "as above" },
+  "schedule": [{ "id": "…", "title": "Dentist", "starts_at": "2026-09-26T15:00:00Z", "...": "..." }],
   "habits": [{ "id": "…", "name": "Read", "unit": "pages", "target_per_week": 5, "done_this_week": 2, "done_today": true }],
+  "pantry": null,
   "knowledge": [{ "score": 0.74, "source": "vault", "path": "memory/projects/ai-tutor-system.md", "start_line": 12, "end_line": 30, "...": "..." }],
   "warnings": []
 }
@@ -355,6 +374,63 @@ curl -H "X-API-Key: $API_KEY" 'localhost:8000/me/context?q=tutor%20course%20desi
 "Today" and "this week" (starting Monday) use the server's local date; event times are compared in UTC. The API asks Ollama to keep the model loaded for an hour, so only the first search after a long idle period pays the ~5-second model load.
 
 Not included yet: keyword or hybrid search, and topic-filtered structured data. Those come later.
+
+## MCP server (Stage 5)
+
+`python -m app.mcp_server` exposes the API as [MCP](https://modelcontextprotocol.io) tools, so MCP clients such as Claude Desktop and Claude Code can read and update your data directly. It speaks **stdio**: the client starts it as a child process when needed, so you never run it yourself.
+
+- **Thin wrapper:** it calls the running HTTP API (`API_URL`, default `http://127.0.0.1:8000`), so the API must be up. The auto-start task handles that. Validation, auth and behaviour are exactly the API's.
+- **API key:** read from this repo's `.env` by absolute path, and sent as `X-API-Key`. The AI client never sees or supplies it.
+- **Errors:** returned as one readable line, never a stack trace. For example: *Not found: Note not found*, *Invalid input: starts_at: Input should have timezone info*, *The Personal API is not reachable at http://127.0.0.1:8000. Is it running?*, *The Personal API rejected the API key*.
+- **Only works on this PC:** the claude.ai website and mobile apps can't launch local stdio servers. Using it from there would need a remote (HTTPS) MCP server exposed to the internet, which is a separate decision with security trade-offs.
+
+### Registering it
+
+Use the virtual environment's Python, by absolute path.
+
+**Claude Code** (available in all your projects):
+```bash
+claude mcp add --scope user --transport stdio personal-api -- "C:\Users\Tyler\Desktop\Personal-API\.venv\Scripts\python.exe" -m app.mcp_server
+```
+
+**Claude Desktop:** Settings → Developer → Edit Config (`%APPDATA%\Claude\claude_desktop_config.json`), add the server under `mcpServers`, then fully quit and restart Claude Desktop:
+```json
+{
+  "mcpServers": {
+    "personal-api": {
+      "command": "C:\\Users\\Tyler\\Desktop\\Personal-API\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "app.mcp_server"]
+    }
+  }
+}
+```
+No `env` or working directory is needed. Server logs go to stderr, which Claude Desktop writes to `%APPDATA%\Claude\logs\mcp-server-personal-api.log`.
+
+### Tools
+
+Every tool starts with a marker saying whether it changes data. Read tools begin with **Read-only.** and carry `readOnlyHint`. Write tools begin with **WRITES DATA** and delete tools with **DELETES DATA PERMANENTLY**; both are marked `readOnlyHint: false`, and updates and deletes are also marked `destructiveHint: true`, so clients can ask before running them.
+
+| Tool | Calls | What it's for |
+|---|---|---|
+| `search_knowledge` | `GET /knowledge/search` | find passages in the vault **by meaning**, with file path and line numbers |
+| `get_context` | `GET /me/context` | quick situational summary. The default is lightweight counts; pass `include` or `q` for detail. |
+| `list_pantry`, `get_pantry_item` | `GET /pantry`, `/pantry/{id}` | inventory, with dietary-tag, expiry and stock filters |
+| `create_pantry_item`, `update_pantry_item`, `delete_pantry_item` | `POST`/`PATCH`/`DELETE /pantry` | change inventory |
+| `adjust_pantry_quantity` | `POST /pantry/{id}/adjust` | "used 2", "bought 3 more" |
+| `list_schedule`, `get_schedule_event` | `GET /schedule`, `/schedule/{id}` | events, optionally within a time window (`from_time`, `to_time`) |
+| `create_schedule_event`, `update_schedule_event`, `delete_schedule_event` | `POST`/`PATCH`/`DELETE /schedule` | change the calendar. Created events get `source: "mcp"`. |
+| `list_habits`, `get_habit` | `GET /habits`, `/habits/{id}` | habit definitions (use `get_context` with `include=["habits"]` for progress) |
+| `create_habit`, `update_habit`, `delete_habit` | `POST`/`PATCH`/`DELETE /habits` | `update_habit` with `active=false` retires a habit but keeps its history |
+| `list_contacts`, `get_contact` | `GET /contacts`, `/contacts/{id}` | people, with relationship, birthday and dietary needs |
+| `create_contact`, `update_contact`, `delete_contact` | `POST`/`PATCH`/`DELETE /contacts` | change contacts |
+| `list_notes`, `get_note` | `GET /notes`, `/notes/{id}` | short saved notes, which are separate from the vault |
+| `create_note`, `update_note`, `delete_note` | `POST`/`PATCH`/`DELETE /notes` | change notes. Created notes get `source: "mcp"`. |
+
+**Other behaviour:**
+- **Updates:** update tools are partial, so only the fields you pass change. List field names in `clear` to erase them.
+- **Lists:** list tools return `{"count": n, "items": [...]}`, paged with `limit` and `offset`.
+- **Ids:** ids must be UUIDs, and anything else is rejected before the API is called.
+- **Not wrapped:** habit check-ins have no API endpoints yet, so there are no check-in tools.
 
 ## Schema overview
 
