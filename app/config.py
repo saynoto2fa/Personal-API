@@ -13,6 +13,12 @@ class Settings(BaseSettings):
     # If set, every request (except /health) must send `X-API-Key: <value>`.
     api_key: str | None = None
 
+    # File watcher (python -m app.watcher). Source name -> folder to index, as JSON, e.g.
+    # WATCH_SOURCES='{"vault": "C:/Users/me/Obsidian", "project:api": "C:/code/api"}'
+    watch_sources: dict[str, str] = {}
+    ollama_url: str = "http://localhost:11434"
+    embed_model: str = "nomic-embed-text"  # must produce 768-dim vectors (see 0002_knowledge_vectors.sql)
+
     @field_validator("api_key")
     @classmethod
     def _blank_is_none(cls, v: str | None) -> str | None:
