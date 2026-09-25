@@ -12,13 +12,13 @@ Obsidian vault ──► file watcher ──► Postgres + pgvector ◄── Fa
 
 | Stage | What | Status |
 |---|---|---|
-| 1 | Postgres schema (all tables) + FastAPI with **pantry CRUD** | ✅ this release |
-| 2 | Endpoints for schedule, habits, contacts, notes | tables exist, endpoints next |
+| 1 | Postgres schema (all tables) + FastAPI with **pantry CRUD** | ✅ done |
+| 2 | CRUD endpoints for **schedule, habits, contacts, notes** | ✅ done (habit check-in endpoints still to come) |
 | 3 | File watcher (vault + project folders → chunks → embeddings in pgvector) | tables exist (`documents`, `chunks`) |
 | 4 | `GET /knowledge/search?q=` and `GET /me/context` | planned |
 | 5 | MCP server wrapping the API | planned |
 
-Each stage works on its own. The pantry API is usable today without pgvector, the watcher or MCP.
+Each stage works on its own. The CRUD APIs are usable today without pgvector, the watcher or MCP.
 
 ## Repo layout
 
@@ -88,11 +88,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 # reachable from your LAN
 
 ## Auth
 
-If `API_KEY` is set in `.env`, every request except `/health` must send `X-API-Key: <key>`. Leave it empty only on a trusted machine. Set it before exposing the API on your network.
+If `API_KEY` is set in `.env`, every endpoint except `/health` requires the header `X-API-Key: <key>`. That covers `/pantry`, `/schedule`, `/habits`, `/contacts` and `/notes`. Leave it empty only on a trusted machine, and set it before exposing the API on your network.
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
+
+The `curl` examples below leave the header out for brevity. Add `-H "X-API-Key: $API_KEY"` when a key is set. In `/docs`, click **Authorize** and paste the key once.
 
 ## Pantry API
 
@@ -151,6 +153,44 @@ curl -X POST localhost:8000/pantry/<id>/adjust -H 'Content-Type: application/jso
 | `dairy_free`, `vegetarian`, `vegan`, `nut_free` | as named |
 
 Tag positively (`gluten_free`) when you've checked. An item with no gluten tag is "unknown", not "safe". So `?tag=gluten_free&exclude_tag=contains_pork` is the strict "safe for everyone" query.
+
+## Schedule, habits, contacts and notes APIs
+
+All four follow the pantry conventions:
+
+- `POST` returns `201` with the created row, `DELETE` returns `204`, and an unknown id returns `404`.
+- `PATCH` changes only the fields you send. Sending `null` clears an optional field, and `null` on a required field returns `422`.
+- List endpoints page with `limit` (default 100, max 500) and `offset`.
+- Tag lists are normalized like dietary tags (`"Book Club"` → `book_club`).
+
+| Resource | Endpoints | List params | Default order |
+|---|---|---|---|
+| Schedule | `GET/POST /schedule`, `GET/PATCH/DELETE /schedule/{id}` | `from`, `to`, `category` | `starts_at` |
+| Habits | `GET/POST /habits`, `GET/PATCH/DELETE /habits/{id}` | `active` | name |
+| Contacts | `GET/POST /contacts`, `GET/PATCH/DELETE /contacts/{id}` | `q` (name), `tag` (repeatable, must have all) | name |
+| Notes | `GET/POST /notes`, `GET/PATCH/DELETE /notes/{id}` | `q` (title or body), `tag` (repeatable), `source` | newest first |
+
+**Validation**
+
+| Resource | Required | Rules |
+|---|---|---|
+| Schedule | `title`, `starts_at` | Timestamps must include a timezone (`Z` or `-06:00`). `ends_at` can't be before `starts_at`. `recurrence_rule` must be an RRULE containing `FREQ=`. A duplicate `source` + `external_id` returns `409`. |
+| Habits | `name` | `name` is unique (duplicates return `409`). `target_per_week` is 1–7. Deleting a habit also deletes its check-ins. |
+| Contacts | `name` | `email` must look like an address. `birthday` can't be in the future. |
+| Notes | `body` | `body` can't be blank. |
+
+`GET /schedule?from=...&to=...` returns events that overlap the window: those that haven't ended by `from` and start by `to`. Recurring events are returned once; RRULEs are stored but not expanded.
+
+```bash
+curl -X POST localhost:8000/schedule -H 'Content-Type: application/json' \
+  -d '{"title": "Dentist", "starts_at": "2026-10-01T09:00:00-06:00", "ends_at": "2026-10-01T10:00:00-06:00"}'
+curl 'localhost:8000/schedule?from=2026-10-01T00:00:00Z&to=2026-10-08T00:00:00Z'
+
+curl -X POST localhost:8000/habits -H 'Content-Type: application/json' -d '{"name": "Read", "target_per_week": 5, "unit": "pages"}'
+curl -X POST localhost:8000/contacts -H 'Content-Type: application/json' \
+  -d '{"name": "Jane Doe", "relationship": "friend", "dietary_tags": ["gluten_free"], "vault_path": "people/jane-doe.md"}'
+curl -X POST localhost:8000/notes -H 'Content-Type: application/json' -d '{"body": "Call the plumber", "tags": ["home"], "source": "chat"}'
+```
 
 ## Schema overview
 

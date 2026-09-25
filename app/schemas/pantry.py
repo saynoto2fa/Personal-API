@@ -1,8 +1,9 @@
-import re
 import uuid
 from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.schemas.common import normalize_tag, normalize_tags  # noqa: F401  (re-exported for callers)
 
 # Suggested vocabulary (not enforced — any snake_case tag is accepted):
 #   gluten_free, contains_gluten, may_contain_gluten,
@@ -18,15 +19,6 @@ RECOMMENDED_DIETARY_TAGS = (
     "vegan",
     "nut_free",
 )
-
-
-def normalize_tag(tag: str) -> str:
-    """'Gluten-Free ' -> 'gluten_free'."""
-    return re.sub(r"[\s\-]+", "_", tag.strip().lower())
-
-
-def normalize_tags(tags: list[str]) -> list[str]:
-    return sorted({t for t in (normalize_tag(x) for x in tags) if t})
 
 
 class _PantryFields(BaseModel):
