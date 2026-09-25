@@ -77,7 +77,11 @@ class ArchiveKeeper:
                 .where(ArchiveEntry.source == source.name)
                 .order_by(ArchiveEntry.first_seen_at, ArchiveEntry.name)
             ).all()
-        return [ArchivedItem(n, d, seen, seen + self.retention) for n, d, seen in rows]
+        # Add the retention in UTC: psycopg returns the database session's timezone, and adding days
+        # to a local wall-clock time shifts the due time by an hour across a DST change.
+        return [
+            ArchivedItem(n, d, seen.astimezone(UTC), seen.astimezone(UTC) + self.retention) for n, d, seen in rows
+        ]
 
     def sweep(self, source: Source) -> list[str]:
         """Register changes, then move every item whose time is up to the Recycle Bin."""
