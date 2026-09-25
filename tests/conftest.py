@@ -34,7 +34,7 @@ def _migrated_db():
 def _clean_tables():
     yield
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE pantry_items"))
+        conn.execute(text("TRUNCATE pantry_items, schedule, habits, habit_checkins, contacts, notes"))
 
 
 @pytest.fixture
