@@ -138,15 +138,27 @@ def build_server(api: ApiClient) -> MCPServer:
     async def search_knowledge(
         q: Annotated[str, Field(min_length=1, max_length=1000, description="What to look for, in plain language")],
         limit: Annotated[int, Field(ge=1, le=50, description="Number of results (default 10, max 50)")] = 10,
-        source: Annotated[str | None, Field(description="Only search one source, e.g. 'vault'")] = None,
+        source: Annotated[
+            str | None, Field(description="Only search one source: 'vault' (Obsidian notes) or 'project:personal-api' (troubleshooting docs)")
+        ] = None,
+        mode: Annotated[
+            Literal["hybrid", "semantic", "keyword"],
+            Field(
+                description="hybrid (default): by meaning AND exact words, merged. semantic: by meaning only. "
+                "keyword: exact words only, best for names, error messages, codes; works even if Ollama is down."
+            ),
+        ] = "hybrid",
     ) -> dict:
-        """Read-only. Search the user's indexed notes and documents (their Obsidian vault) BY MEANING,
-        not by exact words: finds passages about a topic even when phrased differently. Use this for
-        questions like "what have I written about X", project notes, plans, prompts, research.
+        """Read-only. Search the user's indexed notes and documents (their Obsidian vault, plus this
+        project's troubleshooting docs). By default HYBRID: combines search by meaning (finds passages
+        about a topic even when worded differently) with exact keyword matching (finds specific names,
+        error messages, identifiers), merged into one ranking. Use this for "what have I written about X",
+        project notes, plans, prompts, research, or how a past problem was fixed.
         Does NOT search pantry, schedule, habits, contacts or the notes table; use those tools instead.
-        Returns ranked passages with a similarity score (higher is closer; ~0.7+ is a strong match),
-        the file path, heading path and start/end line numbers so the source can be cited."""
-        return await api.request("GET", "/knowledge/search", params={"q": q, "limit": limit, "source": source})
+        Each passage has semantic_score (cosine similarity; ~0.7+ is strong), keyword_score (null if the
+        exact words aren't in it), the file path, heading path and start/end lines for citing."""
+        params = {"q": q, "limit": limit, "source": source, "mode": mode}
+        return await api.request("GET", "/knowledge/search", params=params)
 
     @mcp.tool(annotations=READ)
     async def get_context(
@@ -158,13 +170,28 @@ def build_server(api: ApiClient) -> MCPServer:
         days: Annotated[int, Field(ge=1, le=31, description="Look-ahead for schedule and expiring pantry items (default 7)")] = 7,
         knowledge_limit: Annotated[int, Field(ge=1, le=20, description="Vault notes to return for q (default 5)")] = 5,
         source: Annotated[str | None, Field(description="Only search notes in this source, e.g. 'vault'")] = None,
+        schedule_category: Annotated[
+            str | None, Field(description="Only events in this category, e.g. 'work'. Adds the schedule section.")
+        ] = None,
+        pantry_tag: Annotated[
+            list[str] | None, Field(description="Only pantry items with ALL these tags, e.g. ['gluten_free']. Adds the pantry section.")
+        ] = None,
+        pantry_exclude_tag: Annotated[
+            list[str] | None, Field(description="Only pantry items with NONE of these tags, e.g. ['contains_pork']. Adds the pantry section.")
+        ] = None,
+        pantry_location: Annotated[
+            str | None, Field(description="Only pantry items in this location, e.g. 'fridge'. Adds the pantry section.")
+        ] = None,
     ) -> dict:
         """Read-only. A fast situational snapshot of the user's day. The DEFAULT call is a lightweight
         baseline: summary counts and flags only (events today and upcoming, the next event, pantry
         totals, out-of-stock and expiring counts, active habits and check-ins today/this week).
-        Pass `q` to also get the top vault notes about a topic. For full detail, pass `include`
-        (e.g. ["schedule"] for the upcoming event list, ["pantry","schedule","habits"] for everything),
-        or use the dedicated tools (list_schedule, list_pantry, list_habits) for complete lists."""
+        Pass `q` to also get the top vault notes about a topic (hybrid search). For full detail, pass
+        `include` (e.g. ["schedule"] for the upcoming event list, ["pantry","schedule","habits"] for
+        everything). To scope a section to a topic, use its filters: schedule_category for work vs family
+        events, pantry_tag / pantry_exclude_tag / pantry_location for e.g. gluten-free food in the fridge;
+        a filter adds its section automatically, and the summary counts stay unfiltered.
+        For complete lists use the dedicated tools (list_schedule, list_pantry, list_habits)."""
         return await api.request(
             "GET",
             "/me/context",
@@ -174,6 +201,10 @@ def build_server(api: ApiClient) -> MCPServer:
                 "days": days,
                 "knowledge_limit": knowledge_limit,
                 "source": source,
+                "schedule_category": schedule_category,
+                "pantry_tag": pantry_tag,
+                "pantry_exclude_tag": pantry_exclude_tag,
+                "pantry_location": pantry_location,
             },
         )
 

@@ -1,8 +1,9 @@
 """Split Markdown into ~500-token chunks that remember their heading path and line range.
 
 Blocks (paragraphs, lists, fenced code, headings) are never split unless a single block is
-bigger than a whole chunk. A heading starts a new chunk once the current one has some
-substance, so chunks tend to follow the note's sections. Consecutive chunks within a long
+bigger than a whole chunk. H1/H2 headings always start a new chunk; deeper headings start one
+once the current chunk has some substance, so short subsections merge into the next. Each chunk
+is labeled with the section contributing most of its text. Consecutive chunks within a long
 section share ~50 tokens of overlap so a sentence cut at a boundary is still findable.
 """
 
@@ -12,7 +13,10 @@ from dataclasses import dataclass, field
 CHARS_PER_TOKEN = 4  # rough average for English text with nomic-embed-text's WordPiece tokenizer
 TARGET_TOKENS = 500
 OVERLAP_TOKENS = 50
-MIN_SECTION_TOKENS = 100  # a heading only starts a new chunk once the current one is this big
+MIN_SECTION_TOKENS = 100  # an H3+ heading only starts a new chunk once the current one is this big
+SPLIT_LEVEL = 2  # H1 and H2 headings always start a new chunk
+# Bump when chunking output changes: the watcher re-chunks documents indexed with an older version.
+CHUNKER_VERSION = 2
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 _FENCE = re.compile(r"^\s*(```|~~~)")
@@ -50,6 +54,7 @@ class _Block:
     heading_path: list[str]
     is_heading: bool = False
     is_overlap: bool = False
+    level: int = 0  # heading level (1-6) for heading blocks
 
     @property
     def tokens(self) -> int:
@@ -106,7 +111,7 @@ def _blocks(lines: list[str], start: int) -> tuple[list[_Block], str | None]:
             stack.append((level, heading))
             if level == 1 and first_h1 is None:
                 first_h1 = heading
-            blocks.append(_Block(line.strip(), n, n, path(), is_heading=True))
+            blocks.append(_Block(line.strip(), n, n, path(), is_heading=True, level=level))
             continue
         if not line.strip():
             flush(n - 1)
@@ -157,6 +162,23 @@ def _overlap_tail(block: _Block) -> _Block | None:
     return _Block(text, start, block.end, block.heading_path, is_overlap=True)
 
 
+def _label(blocks: list[_Block]) -> list[str]:
+    """Heading path of the section that contributes the most text to a chunk.
+
+    A chunk can hold a heading-only line (e.g. "# Title" right before "## Setup") or several short
+    subsections; labeling it by whichever came first would point search results at the wrong section.
+    """
+    body = [b for b in blocks if not b.is_overlap and not b.is_heading]
+    if not body:
+        return next(b for b in blocks if not b.is_overlap).heading_path
+    weight: dict[tuple[str, ...], int] = {}
+    for b in body:
+        key = tuple(b.heading_path)
+        weight[key] = weight.get(key, 0) + b.tokens
+    best = max(weight.values())
+    return list(next(tuple(b.heading_path) for b in body if weight[tuple(b.heading_path)] == best))
+
+
 def chunk_markdown(text: str) -> ParsedMarkdown:
     lines = text.splitlines()
     body_start, fm_title = _split_frontmatter(lines)
@@ -175,23 +197,28 @@ def chunk_markdown(text: str) -> ParsedMarkdown:
         if not any(not b.is_overlap for b in cur):
             cur = []  # only carried-over overlap left: nothing new to emit
             return
-        # A chunk belongs to the section of its first new block (overlap may come from before).
-        owner = next(b for b in cur if not b.is_overlap)
         chunks.append(
             Chunk(
                 index=len(chunks),
                 content="\n\n".join(b.text for b in cur),
                 start_line=cur[0].start,
                 end_line=cur[-1].end,
-                heading_path=owner.heading_path,
+                heading_path=_label(cur),
             )
         )
         tail = _overlap_tail(cur[-1]) if keep_overlap and not cur[-1].is_heading else None
         cur = [tail] if tail else []
 
+    def has_body() -> bool:
+        return any(not x.is_overlap and not x.is_heading for x in cur)
+
     for b in blocks:
         cur_tokens = sum(x.tokens for x in cur)
-        if b.is_heading and sum(x.tokens for x in cur if not x.is_overlap) >= MIN_SECTION_TOKENS:
+        new_tokens = sum(x.tokens for x in cur if not x.is_overlap)
+        # H1/H2 always start a new chunk, so each top-level section gets its own correctly
+        # labeled chunk however short it is. Deeper headings only split once the current chunk
+        # has some substance; short subsections merge into the next one.
+        if b.is_heading and has_body() and (b.level <= SPLIT_LEVEL or new_tokens >= MIN_SECTION_TOKENS):
             emit(keep_overlap=False)  # new section: no overlap across section boundaries
         elif cur and cur_tokens + b.tokens > TARGET_TOKENS:
             emit(keep_overlap=not b.is_heading)

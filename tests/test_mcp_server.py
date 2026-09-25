@@ -88,7 +88,9 @@ def test_api_key_is_sent_by_the_server_not_the_client(server, api):
 def test_search_and_context_map_to_endpoints(server, api):
     call(server, "search_knowledge", {"q": "windows auditing", "limit": 3, "source": "vault"})
     assert api.last.method == "GET" and api.last.url.path == "/knowledge/search"
-    assert dict(api.last.url.params) == {"q": "windows auditing", "limit": "3", "source": "vault"}
+    assert dict(api.last.url.params) == {"q": "windows auditing", "limit": "3", "source": "vault", "mode": "hybrid"}
+    call(server, "search_knowledge", {"q": "ERR_4711", "mode": "keyword"})
+    assert api.last.url.params["mode"] == "keyword"
 
     call(server, "get_context", {})
     assert api.last.url.path == "/me/context"
@@ -97,6 +99,12 @@ def test_search_and_context_map_to_endpoints(server, api):
     call(server, "get_context", {"q": "tutor", "include": ["schedule", "habits"], "days": 3})
     assert api.last.url.params["include"] == "schedule,habits"
     assert api.last.url.params["q"] == "tutor" and api.last.url.params["days"] == "3"
+
+    call(server, "get_context", {"schedule_category": "work", "pantry_tag": ["gluten_free"], "pantry_exclude_tag": ["contains_pork"]})
+    params = api.last.url.params
+    assert params["schedule_category"] == "work"
+    assert params.get_list("pantry_tag") == ["gluten_free"] and params.get_list("pantry_exclude_tag") == ["contains_pork"]
+    assert "include" not in params  # the API adds the scoped sections itself
 
 
 def test_lists_are_wrapped_and_repeated_params_kept(server, api):
