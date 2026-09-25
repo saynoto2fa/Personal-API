@@ -46,13 +46,29 @@ class HabitProgress(BaseModel):
     done_today: bool
 
 
+class ContextSummary(BaseModel):
+    """Always returned: counts and flags only, so the default call stays small and fast."""
+
+    schedule_count_today: int = Field(description="Events that overlap today (server's local day)")
+    schedule_count_upcoming: int = Field(description="Events not yet over that start within `days`")
+    next_event: ContextEvent | None = Field(description="The next event that hasn't ended, if any within `days`")
+    pantry_total: int
+    pantry_out_of_stock: int
+    pantry_expiring_count: int = Field(description="In-stock items expiring within `days`, including already expired")
+    habits_active: int
+    habits_done_today: int = Field(description="Active habits with a check-in marked done today")
+    habits_done_this_week: int = Field(description="Check-ins marked done since Monday, across active habits")
+
+
 class MeContext(BaseModel):
     generated_at: datetime
     today: date
     q: str | None = Field(description="Topic used for the knowledge section, if any")
     days: int = Field(description="Look-ahead window used for schedule and expiring pantry items")
-    schedule: list[ContextEvent]
-    pantry: PantrySummary
-    habits: list[HabitProgress]
-    knowledge: list[KnowledgeHit] = Field(description="Top matching notes for `q`; empty when no `q` is given")
+    include: list[str] = Field(description="Sections returned in full detail")
+    summary: ContextSummary
+    schedule: list[ContextEvent] | None = Field(None, description="Only with include=schedule")
+    pantry: PantrySummary | None = Field(None, description="Only with include=pantry")
+    habits: list[HabitProgress] | None = Field(None, description="Only with include=habits")
+    knowledge: list[KnowledgeHit] | None = Field(None, description="Top notes for `q`; only when `q` is given")
     warnings: list[str] = Field(default_factory=list, description="Sections that could not be filled, and why")

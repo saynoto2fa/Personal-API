@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     archive_folder: str = "OUTDATED"
     archive_retention_days: int = 30
 
+    # Where the MCP server (python -m app.mcp_server) reaches this API.
+    api_url: str = "http://127.0.0.1:8000"
+
     @field_validator("api_key")
     @classmethod
     def _blank_is_none(cls, v: str | None) -> str | None:

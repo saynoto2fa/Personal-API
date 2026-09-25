@@ -4,45 +4,45 @@ from app.db import SessionLocal
 from app.models.habits import HabitCheckin
 from tests.test_knowledge import fake_embedder, indexed  # noqa: F401  (shared fixtures)
 
+DETAIL = "pantry,schedule,habits"
+
 
 def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def test_context_validation(api_client, fake_embedder):  # noqa: F811
-    assert api_client.get("/me/context", params={"q": "   "}).status_code == 422
-    assert api_client.get("/me/context", params={"days": 0}).status_code == 422
-    assert api_client.get("/me/context", params={"days": 32}).status_code == 422
-    assert api_client.get("/me/context", params={"knowledge_limit": 21}).status_code == 422
-    assert fake_embedder.texts == []
-
-
-def test_context_snapshot(client, fake_embedder):  # noqa: F811
+def _seed(client) -> dict:
+    """Events, pantry items and habits around 'now'. Returns what the summary should say."""
     now = datetime.now(UTC)
     today = date.today()
+    events = [
+        ("Finished", now - timedelta(hours=3), now - timedelta(hours=2), False),
+        ("Started, no end", now - timedelta(hours=2), None, False),  # a point in time that has passed
+        ("Ongoing", now - timedelta(hours=1), now + timedelta(hours=1), False),
+        ("All day today", now - timedelta(hours=2), None, True),
+        ("Tomorrow", now + timedelta(days=1), None, False),
+        ("Next month", now + timedelta(days=30), None, False),
+    ]
+    for title, start, end, all_day in events:
+        body = {"title": title, "starts_at": _iso(start), "all_day": all_day}
+        if end:
+            body["ends_at"] = _iso(end)
+        assert client.post("/schedule", json=body).status_code == 201
 
-    def event(title, start, **kw):
-        r = client.post("/schedule", json={"title": title, "starts_at": _iso(start), **kw})
-        assert r.status_code == 201, r.text
+    # Same rule as the endpoint: an event overlaps today (server-local) if it hasn't ended by
+    # local midnight and starts before the next one. Depends on the time of day, so compute it.
+    midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_count = sum(
+        1
+        for _, start, end, all_day in events
+        if (end or (start + timedelta(days=1) if all_day else start)) >= midnight and start < midnight + timedelta(days=1)
+    )
 
-    event("Finished", now - timedelta(hours=3), ends_at=_iso(now - timedelta(hours=2)))
-    event("Started, no end", now - timedelta(hours=2))  # a point in time that has passed
-    event("Ongoing", now - timedelta(hours=1), ends_at=_iso(now + timedelta(hours=1)))
-    event("All day today", now - timedelta(hours=2), all_day=True)
-    event("Tomorrow", now + timedelta(days=1))
-    event("Next month", now + timedelta(days=30))
-
-    def item(name, qty, expiry=None):
+    for name, qty, expiry in [("Milk", 1, 2), ("Yogurt", 1, -1), ("Old cheese", 0, -3), ("Rice", 2, 200), ("Salt", 1, None)]:
         body = {"name": name, "qty": qty}
         if expiry is not None:
             body["expiry_estimate"] = str(today + timedelta(days=expiry))
         assert client.post("/pantry", json=body).status_code == 201
-
-    item("Milk", 1, expiry=2)
-    item("Yogurt", 1, expiry=-1)  # already expired, still in stock: worth knowing
-    item("Old cheese", 0, expiry=-3)  # used up: not "expiring"
-    item("Rice", 2, expiry=200)
-    item("Salt", 1)
 
     read = client.post("/habits", json={"name": "Read", "target_per_week": 5}).json()
     walk = client.post("/habits", json={"name": "Walk"}).json()
@@ -55,31 +55,69 @@ def test_context_snapshot(client, fake_embedder):  # noqa: F811
             s.add(HabitCheckin(habit_id=read["id"], checkin_date=monday, done=True))
         s.add(HabitCheckin(habit_id=walk["id"], checkin_date=today, done=False))
 
+    return {
+        "schedule_count_today": today_count,
+        "schedule_count_upcoming": 3,  # Ongoing, All day today, Tomorrow
+        "pantry_total": 5,
+        "pantry_out_of_stock": 1,
+        "pantry_expiring_count": 2,  # Yogurt (expired, in stock) and Milk
+        "habits_active": 2,
+        "habits_done_today": 1,
+        "habits_done_this_week": 1 if monday == today else 2,
+    }
+
+
+def test_context_validation(api_client, fake_embedder):  # noqa: F811
+    assert api_client.get("/me/context", params={"q": "   "}).status_code == 422
+    assert api_client.get("/me/context", params={"days": 0}).status_code == 422
+    assert api_client.get("/me/context", params={"days": 32}).status_code == 422
+    assert api_client.get("/me/context", params={"knowledge_limit": 21}).status_code == 422
+    r = api_client.get("/me/context", params={"include": "pantry,weather"})
+    assert r.status_code == 422 and "weather" in r.json()["detail"]
+    r = api_client.get("/me/context", params={"include": "knowledge"})
+    assert r.status_code == 422 and "needs q" in r.json()["detail"]
+    assert fake_embedder.texts == []
+
+
+def test_default_is_a_lightweight_summary(client, fake_embedder):  # noqa: F811
+    expected = _seed(client)
     r = client.get("/me/context")
     assert r.status_code == 200, r.text
     ctx = r.json()
+    assert ctx["include"] == []
+    assert ctx["schedule"] is None and ctx["pantry"] is None and ctx["habits"] is None and ctx["knowledge"] is None
+    summary = ctx["summary"]
+    assert summary["next_event"]["title"] == "All day today"
+    assert {k: summary[k] for k in expected} == expected
+    assert fake_embedder.texts == []
 
-    assert ctx["today"] == str(today)
-    assert ctx["days"] == 7 and ctx["q"] is None
+
+def test_include_returns_full_detail_for_requested_sections(client, fake_embedder):  # noqa: F811
+    _seed(client)
+    today = date.today()
+
+    r = client.get("/me/context", params={"include": " Schedule , pantry,habits,pantry"})
+    assert r.status_code == 200, r.text
+    ctx = r.json()
+    assert ctx["include"] == ["pantry", "schedule", "habits"]
     # Sorted by start: the all-day event began 2h ago, "Ongoing" 1h ago.
     assert [e["title"] for e in ctx["schedule"]] == ["All day today", "Ongoing", "Tomorrow"]
-
-    assert ctx["pantry"]["total_items"] == 5
-    assert ctx["pantry"]["out_of_stock"] == 1
+    assert ctx["pantry"]["total_items"] == 5 and ctx["pantry"]["out_of_stock"] == 1
     assert [i["name"] for i in ctx["pantry"]["expiring"]] == ["Yogurt", "Milk"]
-
     habits = {h["name"]: h for h in ctx["habits"]}
     assert set(habits) == {"Read", "Walk"}
+    assert habits["Read"]["done_today"] is True and habits["Read"]["target_per_week"] == 5
+    monday = today - timedelta(days=today.weekday())
     assert habits["Read"]["done_this_week"] == (1 if monday == today else 2)
-    assert habits["Read"]["done_today"] is True
-    assert habits["Read"]["target_per_week"] == 5
-    assert habits["Walk"] == {**habits["Walk"], "done_this_week": 0, "done_today": False}
+    assert habits["Walk"]["done_this_week"] == 0 and habits["Walk"]["done_today"] is False
+    assert ctx["knowledge"] is None and ctx["warnings"] == []
 
-    assert ctx["knowledge"] == [] and ctx["warnings"] == []
-    assert fake_embedder.texts == []  # no topic, no search
+    only = client.get("/me/context", params={"include": "pantry"}).json()
+    assert only["pantry"] is not None and only["schedule"] is None and only["habits"] is None
 
-    wider = client.get("/me/context", params={"days": 31}).json()
+    wider = client.get("/me/context", params={"include": "schedule", "days": 31}).json()
     assert [e["title"] for e in wider["schedule"]][-1] == "Next month"
+    assert wider["summary"]["schedule_count_upcoming"] == 4
 
 
 def test_context_knowledge_section_uses_topic(client, indexed, fake_embedder):  # noqa: F811
@@ -87,9 +125,14 @@ def test_context_knowledge_section_uses_topic(client, indexed, fake_embedder):  
     assert r.status_code == 200, r.text
     ctx = r.json()
     assert ctx["q"] == "pasta recipe"
+    assert ctx["include"] == ["knowledge"]
+    assert ctx["pantry"] is None  # a topic alone doesn't pull in the other sections
     assert len(ctx["knowledge"]) == 2
     assert ctx["knowledge"][0]["path"] == "food/pasta.md"
     assert fake_embedder.texts == ["search_query: pasta recipe"]
+
+    both = client.get("/me/context", params={"q": "pasta", "include": "knowledge,habits", "source": indexed.name}).json()
+    assert both["include"] == ["habits", "knowledge"] and both["habits"] == [] and both["knowledge"]
 
 
 def test_context_still_answers_when_ollama_is_down(client, fake_embedder):  # noqa: F811
@@ -99,3 +142,4 @@ def test_context_still_answers_when_ollama_is_down(client, fake_embedder):  # no
     ctx = r.json()
     assert ctx["knowledge"] == []
     assert len(ctx["warnings"]) == 1 and ctx["warnings"][0].startswith("knowledge: search unavailable")
+    assert ctx["summary"]["pantry_total"] == 0
