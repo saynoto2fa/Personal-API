@@ -39,6 +39,7 @@ class Source:
 
     name: str
     root: Path
+    archive: str | None = None  # top-level folder of retired notes (e.g. OUTDATED); never indexed
 
     def rel_dir(self, path: str | os.PathLike) -> str | None:
         """Folder path relative to the root ('' for the root), or None if outside it or excluded."""
@@ -47,6 +48,8 @@ class Source:
         except ValueError:
             return None
         if any(part in EXCLUDED_DIRS for part in rel.parts):
+            return None
+        if self.archive and rel.parts and rel.parts[0].casefold() == self.archive.casefold():
             return None
         return "" if rel == PurePath(".") else rel.as_posix()
 

@@ -174,3 +174,21 @@ def test_source_path_filtering(tmp_path):
     assert src.rel_file(tmp_path.parent / "outside.md") is None
     assert src.rel_dir(tmp_path) == ""
     assert src.rel_dir(tmp_path / "node_modules") is None
+
+    archived = Source("x", tmp_path, archive="OUTDATED")
+    assert archived.rel_file(tmp_path / "OUTDATED" / "old.md") is None
+    assert archived.rel_file(tmp_path / "outdated" / "sub" / "old.md") is None  # case-insensitive
+    assert archived.rel_file(tmp_path / "notes" / "OUTDATED" / "x.md") == "notes/OUTDATED/x.md"  # top level only
+    assert archived.rel_file(tmp_path / "OUTDATED-ideas.md") == "OUTDATED-ideas.md"
+
+
+def test_sync_skips_archive_folder_and_drops_its_old_documents(source, indexer):
+    _write(source, "keep.md", "k")
+    _write(source, "OUTDATED/old.md", "o")
+    indexer.sync(source)
+    assert set(_docs(source)) == {"keep.md", "OUTDATED/old.md"}  # indexed before an archive was configured
+
+    archived = Source(source.name, source.root, archive="OUTDATED")
+    counts, _ = indexer.sync(archived)
+    assert counts == {"unchanged": 1, "removed": 1}
+    assert set(_docs(source)) == {"keep.md"}
