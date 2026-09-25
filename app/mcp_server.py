@@ -339,7 +339,8 @@ def build_server(api: ApiClient) -> MCPServer:
         offset: Offset = 0,
     ) -> dict:
         """Read-only. List the habits the user tracks (definitions: name, weekly target, unit, active).
-        For this week's progress, use get_context with include=["habits"]."""
+        For this week's progress, use get_context with include=["habits"]; to record that a habit was
+        done, use create_habit_checkin."""
         return _listing(await api.request("GET", "/habits", params={"active": active, "limit": limit, "offset": offset}))
 
     @mcp.tool(annotations=READ)
@@ -384,6 +385,43 @@ def build_server(api: ApiClient) -> MCPServer:
         but keep history, prefer update_habit with active=false."""
         await api.request("DELETE", f"/habits/{_id(id, 'habit')}")
         return {"deleted": id}
+
+    @mcp.tool(annotations=READ)
+    async def list_habit_checkins(
+        habit_id: Annotated[str, Field(description="Habit id (UUID); find it with list_habits")],
+        from_date: IsoDate = None,
+        to_date: IsoDate = None,
+        limit: Limit = 100,
+        offset: Offset = 0,
+    ) -> dict:
+        """Read-only. List the days a habit was checked in (done or explicitly skipped), most recent
+        first, optionally within a date range."""
+        params = {"from": from_date, "to": to_date, "limit": limit, "offset": offset}
+        return _listing(await api.request("GET", f"/habits/{_id(habit_id, 'habit')}/checkins", params=params))
+
+    @mcp.tool(annotations=CREATE)
+    async def create_habit_checkin(
+        habit_id: Annotated[str, Field(description="Habit id (UUID); find it with list_habits")],
+        checkin_date: Annotated[str | None, Field(description="YYYY-MM-DD; defaults to today. Can't be in the future.")] = None,
+        done: Annotated[bool, Field(description="false records that the habit was deliberately skipped that day")] = True,
+        value: Annotated[float | None, Field(description="For measured habits, amount in the habit's unit (e.g. 20 pages)")] = None,
+        note: Annotated[str | None, Field(max_length=1000)] = None,
+    ) -> dict:
+        """WRITES DATA: records that the user did a habit on a day (e.g. "I read today", "log my run
+        for yesterday"). One check-in per habit per day: if that day is already recorded this returns
+        a Conflict error; delete_habit_checkin first to correct it. Returns the created check-in."""
+        body = {"checkin_date": checkin_date, "done": done, "value": value, "note": note}
+        path = f"/habits/{_id(habit_id, 'habit')}/checkins"
+        return await api.request("POST", path, json={k: v for k, v in body.items() if v is not None})
+
+    @mcp.tool(annotations=DELETE)
+    async def delete_habit_checkin(
+        habit_id: Annotated[str, Field(description="Habit id (UUID)")],
+        checkin_id: Annotated[str, Field(description="Check-in id (UUID), from list_habit_checkins")],
+    ) -> dict:
+        """DELETES DATA PERMANENTLY: removes one habit check-in, e.g. one recorded by mistake."""
+        await api.request("DELETE", f"/habits/{_id(habit_id, 'habit')}/checkins/{_id(checkin_id, 'check-in')}")
+        return {"deleted": checkin_id}
 
     # -----------------------------------------------------------------------
     # Contacts

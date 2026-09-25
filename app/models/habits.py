@@ -23,7 +23,7 @@ class Habit(Base):
 
 
 class HabitCheckin(Base):
-    """One row per habit per day (no endpoints yet; read by /me/context)."""
+    """One row per habit per day (UNIQUE habit_id + checkin_date)."""
 
     __tablename__ = "habit_checkins"
 
