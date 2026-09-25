@@ -10,10 +10,14 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    # Stage 3: file watcher + embeddings
+    "watchdog>=4.0",
+    "pgvector>=0.3",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.27"]
+dev = ["pytest>=8"]
 
 [build-system]
 requires = ["setuptools>=68"]
