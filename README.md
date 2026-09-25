@@ -26,18 +26,24 @@ Each stage works on its own. The CRUD APIs work without pgvector, Ollama or the 
 migrations/                 SQL migrations, applied in order by app/migrate.py
   0001_core_schema.sql      pantry_items, schedule, habits, habit_checkins, contacts, notes
   0002_knowledge_vectors.sql  documents + chunks (vector(768)), needs pgvector
+  0003_archive_entries.sql  retention clock for the OUTDATED folder
 app/
   main.py                   FastAPI app
   config.py                 settings from env / .env
   db.py                     SQLAlchemy engine + session
   auth.py                   optional X-API-Key check
   migrate.py                migration runner (python -m app.migrate)
+  serve.py                  run the API with file logging (used by auto-start)
   models/  schemas/  routers/
   watcher/                  file watcher + embedding pipeline (python -m app.watcher)
     chunker.py              Markdown -> ~500-token chunks with heading path + line range
     embedder.py             Ollama client (batching, retries)
     indexer.py              files -> documents/chunks, one file at a time
     watch.py                watchdog events -> debounced, retried jobs
+    archive.py              OUTDATED retention: 30 days, then the Recycle Bin
+scripts/
+  install-autostart.ps1     start the API + watcher at Windows logon (Task Scheduler)
+  uninstall-autostart.ps1   remove those tasks
 tests/                      pytest suite (unit tests run anywhere; DB tests need TEST_DATABASE_URL)
 docker-compose.yml          local Postgres 16 + pgvector
 ```
@@ -220,6 +226,8 @@ curl -X POST localhost:8000/notes -H 'Content-Type: application/json' -d '{"body
 python -m app.watcher            # sync everything, then watch for changes (Ctrl+C to stop)
 python -m app.watcher --once     # sync and exit (exit code 1 if any file failed)
 python -m app.watcher --status   # files and chunks indexed per source
+python -m app.watcher --archive-status   # what's in OUTDATED and when each item is cleared
+python -m app.watcher --log-file logs/watcher.log   # log to a rotating file instead of the console
 python -m app.watcher --source vault --debounce 5   # one source; wait 5s after the last save
 ```
 
@@ -227,7 +235,8 @@ The first run embeds every file. For this vault that was 71 notes → 938 chunks
 
 ### What it does
 
-- **Files:** `.md` files under each source folder. It skips `.obsidian`, `.git`, `.trash`, `node_modules`, `.venv`/`venv` and `__pycache__`.
+- **Files:** `.md` files under each source folder. It skips `.obsidian`, `.git`, `.trash`, `node_modules`, `.venv`/`venv`, `__pycache__`, and the archive folder (`OUTDATED` by default; see below).
+- **One at a time:** only one watcher runs at once. A second one sees the lock in `logs/watcher.lock` and exits.
 - **Chunking:** about 500 tokens per chunk (estimated as 4 characters per token). Paragraphs, lists and fenced code blocks stay whole unless one is bigger than a chunk. A heading starts a new chunk once the current one has at least ~100 tokens. Chunks within a long section overlap by ~50 tokens; chunks never overlap across sections. YAML frontmatter is left out of chunks but used for the title.
 - **Traceability:** each chunk's `metadata` holds `heading_path`, `start_line` and `end_line`, with line numbers from the original file. `documents.path` is relative to the source folder, and `chunks.token_count` is the estimate.
 - **Embedding:** each chunk is embedded as `search_document: <title> > <headings>` followed by the chunk text, 16 chunks per Ollama request.
@@ -236,6 +245,32 @@ The first run embeds every file. For this vault that was 71 notes → 938 chunks
 - **Debouncing:** rapid saves (Obsidian autosaves every couple of seconds) are collapsed into one reindex, 2 seconds after the last change by default.
 - **Failures:** if Ollama is down or the database is unreachable, each embed request is retried 4 times with backoff (1s, 2s, 4s). After that, the file is queued again every 60 seconds. The watcher keeps running.
 - **Changing the model:** `documents.metadata.embed_model` records which model embedded each file. Changing `EMBED_MODEL` re-embeds every file on the next sync, but the vector size must still be 768 unless you add a migration.
+
+### Archive folder (OUTDATED)
+
+Move a note or folder into `OUTDATED` at the top of the vault to retire it without deleting it right away:
+
+- **Search:** it disappears from the index immediately. Move it back out and it's indexed again.
+- **Clearing:** after **30 days** in `OUTDATED`, the watcher moves it to the **Windows Recycle Bin**, so it can still be restored from there. It checks hourly while running.
+- **Clock:** Windows keeps a file's dates when it's moved, so the clock starts when the watcher first sees the item there, not from the file's date. If the watcher was off, the clock starts when it next runs, so the hold is only ever longer.
+- **Items:** each direct child of `OUTDATED` is one item; a folder moves to the Recycle Bin as a whole.
+- **Resetting:** moving an item out forgets it, and moving it back in starts a new 30 days.
+- **Locked files:** if a file is open in another program, it is retried on the next check.
+- **Settings:** `ARCHIVE_FOLDER` and `ARCHIVE_RETENTION_DAYS` in `.env`. `0` keeps the folder out of search but never clears it.
+- **Checking:** `python -m app.watcher --archive-status` lists each item with its due date.
+
+### Running in the background on Windows
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1
+```
+
+This registers two per-user Task Scheduler tasks under `\Personal-API\`, called **API server** and **Watcher**. Both start at logon with no console window and log to `logs\api.log` and `logs\watcher.log`. Each task also re-runs every 5 minutes; if the process is still running, the new run is ignored, so this only restarts it after a crash. Other details:
+
+- **Start now without logging out:** `Start-ScheduledTask -TaskPath '\Personal-API\' -TaskName 'Watcher'`
+- **Remove:** `powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1`
+- **Restart after code changes:** run `Stop-ScheduledTask`, then `Start-ScheduledTask`.
+- **Port 8000:** stop the API task before running `uvicorn --reload` yourself, or the two will fight over the port.
 
 > **Stage 4 note:** nomic-embed-text expects task prefixes. Documents are stored with `search_document: `, so search queries must be embedded with `search_query: ` (see `QUERY_PREFIX` in `app/watcher/embedder.py`). Without it, results get noticeably worse.
 
@@ -249,6 +284,7 @@ All tables use UUID primary keys, and `created_at`/`updated_at` are maintained b
 - **contacts**: name, relationship, email, phone, birthday, dietary_tags[] (for guests), tags[], vault_path (link to `people/*.md`)
 - **notes**: generic catch-all with tags[] and source (`chat`, `hermes`, `obsidian`, ...)
 - **documents** + **chunks**: one row per indexed file with a `content_hash`, so the watcher can skip unchanged files. Chunks store `embedding vector(768)` with an HNSW cosine index.
+- **archive_entries**: one row per item in a source's archive folder, with `first_seen_at` (the retention clock).
 
 > **Embedding size:** 768 matches `nomic-embed-text` (runs locally via Ollama, a good fit for Hermes). If you pick a different embedding model, change `vector(768)` in `0002` *before* indexing, or add a migration that alters the column and re-embeds.
 

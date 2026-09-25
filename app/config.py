@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     watch_sources: dict[str, str] = {}
     ollama_url: str = "http://localhost:11434"
     embed_model: str = "nomic-embed-text"  # must produce 768-dim vectors (see 0002_knowledge_vectors.sql)
+    # Folder at the top of each source that holds retired notes. It is not indexed, and items in
+    # it go to the Recycle Bin after this many days there (0 = keep it out of search, never clear it).
+    archive_folder: str = "OUTDATED"
+    archive_retention_days: int = 30
 
     @field_validator("api_key")
     @classmethod

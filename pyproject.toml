@@ -14,6 +14,7 @@ dependencies = [
     "watchdog>=4.0",
     "pgvector>=0.3",
     "httpx>=0.27",
+    "send2trash>=1.8",  # archive retention: Recycle Bin instead of permanent delete
 ]
 
 [project.optional-dependencies]
