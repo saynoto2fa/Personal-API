@@ -31,6 +31,19 @@ def test_batches_requests():
     assert sizes == [4, 4, 2]
 
 
+def test_keep_alive_is_sent_only_when_set():
+    payloads = []
+
+    def handler(request):
+        payloads.append(json.loads(request.content))
+        return _ok(request)
+
+    _embedder(handler)[0].embed(["a"])
+    _embedder(handler, keep_alive="1h")[0].embed(["a"])
+    assert "keep_alive" not in payloads[0]
+    assert payloads[1]["keep_alive"] == "1h"
+
+
 def test_retries_connection_errors_then_succeeds():
     calls = {"n": 0}
 

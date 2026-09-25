@@ -15,7 +15,7 @@ Obsidian vault ──► file watcher ──► Postgres + pgvector ◄── Fa
 | 1 | Postgres schema (all tables) + FastAPI with **pantry CRUD** | ✅ done |
 | 2 | CRUD endpoints for **schedule, habits, contacts, notes** | ✅ done (habit check-in endpoints still to come) |
 | 3 | File watcher (vault + project folders → chunks → embeddings in pgvector) | ✅ done (`python -m app.watcher`) |
-| 4 | `GET /knowledge/search?q=` and `GET /me/context` | planned |
+| 4 | `GET /knowledge/search?q=` and `GET /me/context` | ✅ done |
 | 5 | MCP server wrapping the API | planned |
 
 Each stage works on its own. The CRUD APIs work without pgvector, Ollama or the watcher; the watcher needs pgvector and a local Ollama.
@@ -34,6 +34,7 @@ app/
   auth.py                   optional X-API-Key check
   migrate.py                migration runner (python -m app.migrate)
   serve.py                  run the API with file logging (used by auto-start)
+  search.py                 semantic search over chunks (used by /knowledge/search and /me/context)
   models/  schemas/  routers/
   watcher/                  file watcher + embedding pipeline (python -m app.watcher)
     chunker.py              Markdown -> ~500-token chunks with heading path + line range
@@ -99,7 +100,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 # reachable from your LAN
 
 ## Auth
 
-If `API_KEY` is set in `.env`, every endpoint except `/health` requires the header `X-API-Key: <key>`. That covers `/pantry`, `/schedule`, `/habits`, `/contacts` and `/notes`. Leave it empty only on a trusted machine, and set it before exposing the API on your network.
+If `API_KEY` is set in `.env`, every endpoint except `/health` requires the header `X-API-Key: <key>`. That covers `/pantry`, `/schedule`, `/habits`, `/contacts`, `/notes`, `/knowledge/search` and `/me/context`. Leave it empty only on a trusted machine, and set it before exposing the API on your network.
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"
@@ -205,7 +206,7 @@ curl -X POST localhost:8000/notes -H 'Content-Type: application/json' -d '{"body
 
 ## File watcher (Stage 3)
 
-`python -m app.watcher` indexes Markdown files into `documents` and `chunks` with local embeddings, then keeps them in sync as files change. It is its own long-running process, separate from the API server. There is no search endpoint yet; that comes in Stage 4.
+`python -m app.watcher` indexes Markdown files into `documents` and `chunks` with local embeddings, then keeps them in sync as files change. It is its own long-running process, separate from the API server. Search over the index is in Stage 4, below.
 
 ### Requirements
 
@@ -272,7 +273,88 @@ This registers two per-user Task Scheduler tasks under `\Personal-API\`, called 
 - **Restart after code changes:** run `Stop-ScheduledTask`, then `Start-ScheduledTask`.
 - **Port 8000:** stop the API task before running `uvicorn --reload` yourself, or the two will fight over the port.
 
-> **Stage 4 note:** nomic-embed-text expects task prefixes. Documents are stored with `search_document: `, so search queries must be embedded with `search_query: ` (see `QUERY_PREFIX` in `app/watcher/embedder.py`). Without it, results get noticeably worse.
+## Knowledge search and context (Stage 4)
+
+Both endpoints are read-only, need `X-API-Key`, and embed the query with the local Ollama model, so Ollama must be running.
+
+> ⚠️ **Query and document prefixes are different on purpose. Don't "fix" this.**
+> nomic-embed-text is trained with task prefixes. Chunks are indexed as `search_document: …` (`DOC_PREFIX`), and queries are embedded as `search_query: …` (`QUERY_PREFIX`, both in `app/watcher/embedder.py`). The mismatch is how the model is meant to be used. Giving queries the document prefix, or dropping the prefixes, makes rankings noticeably worse. If you ever switch models, check which prefixes the new model expects and re-index.
+
+### `GET /knowledge/search`
+
+| Param | Meaning |
+|---|---|
+| `q` | required: what to look for, in plain language (1–1000 characters, not blank) |
+| `limit` | results to return (default 10, max 50) |
+| `source` | only search one source, e.g. `vault` (matches `documents.source`) |
+
+Results are ranked by cosine similarity (`<=>` on `chunks.embedding`, HNSW `vector_cosine_ops` index), best first. `score` is `1 - cosine distance`; on this vault a strong match is about 0.7–0.8. Each hit points back to its file and lines. Notes in `OUTDATED` are never returned, because they aren't indexed.
+
+```bash
+curl -H "X-API-Key: $API_KEY" 'localhost:8000/knowledge/search?q=windows%20process%20auditing&limit=2'
+```
+```json
+{
+  "query": "windows process auditing",
+  "source": null,
+  "results": [
+    {
+      "score": 0.789,
+      "source": "vault",
+      "path": "Windows-Process-Auditor.md",
+      "title": "Windows Background Process Auditor",
+      "chunk_index": 0,
+      "heading_path": ["Windows Background Process Auditor"],
+      "start_line": 1,
+      "end_line": 7,
+      "content": "# Windows Background Process Auditor\n\n..."
+    },
+    { "score": 0.772, "path": "Windows-Process-Auditor.md", "heading_path": ["Windows Background Process Auditor", "Steps"], "start_line": 9, "end_line": 31, "...": "..." }
+  ]
+}
+```
+
+Errors: `422` for a missing, blank or too-long `q` or an out-of-range `limit`; `503` if Ollama can't embed the query (not running, or model not pulled).
+
+### `GET /me/context`
+
+A small, fast snapshot of what's going on, for assistants to read at the start of a conversation. It is not an export; use the resource endpoints for full lists.
+
+| Param | Meaning |
+|---|---|
+| `q` | optional topic. When given, the `knowledge` section holds the top matching notes; without it, `knowledge` is empty. |
+| `days` | look-ahead window for schedule and expiring pantry items (default 7, max 31) |
+| `knowledge_limit` | notes to include for `q` (default 5, max 20) |
+| `source` | only search notes in this source |
+
+| Section | Contents (capped) |
+|---|---|
+| `schedule` | events not yet over and starting within `days`, soonest first (max 20). All-day events without an end count as lasting that day. |
+| `pantry` | `total_items`, `out_of_stock`, and `expiring`: in-stock items expiring within `days`, including already-expired ones (max 15) |
+| `habits` | active habits with `done_this_week` (check-ins marked done since Monday) and `done_today` (max 30) |
+| `knowledge` | the same hits as `/knowledge/search`, for `q` |
+| `warnings` | sections that couldn't be filled. If Ollama is down, the rest of the snapshot is still returned, with a warning instead of a 503. |
+
+```bash
+curl -H "X-API-Key: $API_KEY" 'localhost:8000/me/context?q=tutor%20course%20design&knowledge_limit=3'
+```
+```json
+{
+  "generated_at": "2026-09-25T03:40:12Z",
+  "today": "2026-09-24",
+  "q": "tutor course design",
+  "days": 7,
+  "schedule": [{ "id": "…", "title": "Dentist", "starts_at": "2026-09-26T15:00:00Z", "ends_at": "2026-09-26T16:00:00Z", "all_day": false, "location": null, "category": "health" }],
+  "pantry": { "total_items": 12, "out_of_stock": 1, "expiring": [{ "id": "…", "name": "Milk", "qty": 1.0, "unit": "l", "location": "fridge", "expiry_estimate": "2026-09-26" }] },
+  "habits": [{ "id": "…", "name": "Read", "unit": "pages", "target_per_week": 5, "done_this_week": 2, "done_today": true }],
+  "knowledge": [{ "score": 0.74, "source": "vault", "path": "memory/projects/ai-tutor-system.md", "start_line": 12, "end_line": 30, "...": "..." }],
+  "warnings": []
+}
+```
+
+"Today" and "this week" (starting Monday) use the server's local date; event times are compared in UTC. The API asks Ollama to keep the model loaded for an hour, so only the first search after a long idle period pays the ~5-second model load.
+
+Not included yet: keyword or hybrid search, and topic-filtered structured data. Those come later.
 
 ## Schema overview
 

@@ -33,8 +33,17 @@ def migrated_db():
 
 
 @pytest.fixture
+def api_client():
+    """TestClient for tests that never reach the database (auth, request validation)."""
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture
 def client(migrated_db):
     with TestClient(app) as c:
         yield c
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE pantry_items, schedule, habits, habit_checkins, contacts, notes, documents CASCADE"))
+        conn.execute(
+            text("TRUNCATE pantry_items, schedule, habits, habit_checkins, contacts, notes, documents, archive_entries CASCADE")
+        )
