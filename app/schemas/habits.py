@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -45,3 +45,22 @@ class HabitRead(BaseModel):
     active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class HabitCheckinCreate(BaseModel):
+    checkin_date: date | None = Field(None, description="Day of the check-in; defaults to today (server's local date)")
+    done: bool = Field(True, description="false records that the habit was explicitly skipped that day")
+    value: float | None = Field(None, description="For measured habits, in the habit's unit", examples=[20])
+    note: str | None = Field(None, max_length=1000)
+
+
+class HabitCheckinRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    habit_id: uuid.UUID
+    checkin_date: date
+    done: bool
+    value: float | None
+    note: str | None
+    created_at: datetime

@@ -15,6 +15,7 @@ EXPECTED_TOOLS = {
     "list_pantry", "get_pantry_item", "create_pantry_item", "update_pantry_item", "adjust_pantry_quantity", "delete_pantry_item",
     "list_schedule", "get_schedule_event", "create_schedule_event", "update_schedule_event", "delete_schedule_event",
     "list_habits", "get_habit", "create_habit", "update_habit", "delete_habit",
+    "list_habit_checkins", "create_habit_checkin", "delete_habit_checkin",
     "list_contacts", "get_contact", "create_contact", "update_contact", "delete_contact",
     "list_notes", "get_note", "create_note", "update_note", "delete_note",
 }  # fmt: skip
@@ -134,6 +135,26 @@ def test_delete_and_adjust(server, api):
     api.response = httpx.Response(200, json={"qty": 4})
     call(server, "adjust_pantry_quantity", {"id": ITEM_ID, "delta": -2})
     assert api.last.url.path == f"/pantry/{ITEM_ID}/adjust" and json.loads(api.last.content) == {"delta": -2}
+
+
+def test_habit_checkin_tools(server, api):
+    other_id = "3f2b8c1e-0000-4000-8000-000000000002"
+    api.response = httpx.Response(201, json={"id": other_id})
+    call(server, "create_habit_checkin", {"habit_id": ITEM_ID, "value": 20})
+    assert api.last.method == "POST" and api.last.url.path == f"/habits/{ITEM_ID}/checkins"
+    assert json.loads(api.last.content) == {"done": True, "value": 20}  # no date: the API uses today
+
+    api.response = httpx.Response(200, json=[{"checkin_date": "2026-10-02"}])
+    out = call(server, "list_habit_checkins", {"habit_id": ITEM_ID, "from_date": "2026-10-01", "to_date": "2026-10-07"})
+    assert out["count"] == 1
+    assert dict(api.last.url.params) == {"from": "2026-10-01", "to": "2026-10-07", "limit": "100", "offset": "0"}
+
+    api.response = httpx.Response(204)
+    assert call(server, "delete_habit_checkin", {"habit_id": ITEM_ID, "checkin_id": other_id}) == {"deleted": other_id}
+    assert api.last.method == "DELETE" and api.last.url.path == f"/habits/{ITEM_ID}/checkins/{other_id}"
+
+    api.response = httpx.Response(409, json={"detail": "This habit already has a check-in for 2026-10-02"})
+    assert "Conflict: This habit already has a check-in" in call_error(server, "create_habit_checkin", {"habit_id": ITEM_ID})
 
 
 def test_bad_ids_never_reach_the_api(server, api):

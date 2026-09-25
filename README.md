@@ -13,12 +13,15 @@ Obsidian vault ──► file watcher ──► Postgres + pgvector ◄── Fa
 | Stage | What | Status |
 |---|---|---|
 | 1 | Postgres schema (all tables) + FastAPI with **pantry CRUD** | ✅ done |
-| 2 | CRUD endpoints for **schedule, habits, contacts, notes** | ✅ done (habit check-in endpoints still to come) |
+| 2 | CRUD endpoints for **schedule, habits, contacts, notes** | ✅ done |
+| 6 | Habit check-ins (API + MCP) and a local throwaway test database | ✅ done |
 | 3 | File watcher (vault + project folders → chunks → embeddings in pgvector) | ✅ done (`python -m app.watcher`) |
 | 4 | `GET /knowledge/search?q=` and `GET /me/context` | ✅ done |
 | 5 | MCP server wrapping the API | ✅ done (`python -m app.mcp_server`, stdio) |
 
 Each stage works on its own. The CRUD APIs work without pgvector, Ollama or the watcher; the watcher needs pgvector and a local Ollama.
+
+**Something not working?** See [docs/troubleshooting.md](docs/troubleshooting.md): symptoms, causes and fixes for every problem hit so far. It's also indexed by the watcher, so assistants can find it with `search_knowledge`.
 
 ## Repo layout
 
@@ -46,7 +49,7 @@ app/
 scripts/
   install-autostart.ps1     start the API + watcher at Windows logon (Task Scheduler)
   uninstall-autostart.ps1   remove those tasks
-tests/                      pytest suite (unit tests run anywhere; DB tests need TEST_DATABASE_URL)
+tests/                      pytest suite; DB tests use the local test database (tests/testdb.py)
 docker-compose.yml          local Postgres 16 + pgvector
 ```
 
@@ -194,12 +197,27 @@ All four follow the pantry conventions:
 
 `GET /schedule?from=...&to=...` returns events that overlap the window: those that haven't ended by `from` and start by `to`. Recurring events are returned once; RRULEs are stored but not expanded.
 
+### Habit check-ins
+
+A check-in records that a habit was done, or deliberately skipped with `done: false`, on a given day. There is at most one per habit per day.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/habits/{habit_id}/checkins` | record a day. The body fields are optional: `checkin_date` (defaults to today), `done` (default `true`), `value` (for measured habits, e.g. pages), `note`. Returns `201`. |
+| `GET` | `/habits/{habit_id}/checkins` | list a habit's check-ins, most recent day first. Filters: `from`, `to` (dates), `limit`, `offset`. |
+| `DELETE` | `/habits/{habit_id}/checkins/{checkin_id}` | remove a mistaken entry (`204`) |
+
+- **Errors:** an unknown habit is a `404`. A second check-in for the same habit and day is a `409`; delete the first one to change it. A future date is a `422`.
+- **"Today":** means the server's local date. The API always sends the date itself, because the column's `CURRENT_DATE` default is the database's UTC date, which is already tomorrow on a US evening.
+- **In `/me/context`:** check-ins with `done: true` count towards `habits_done_today` and `habits_done_this_week`.
+
 ```bash
 curl -X POST localhost:8000/schedule -H 'Content-Type: application/json' \
   -d '{"title": "Dentist", "starts_at": "2026-10-01T09:00:00-06:00", "ends_at": "2026-10-01T10:00:00-06:00"}'
 curl 'localhost:8000/schedule?from=2026-10-01T00:00:00Z&to=2026-10-08T00:00:00Z'
 
 curl -X POST localhost:8000/habits -H 'Content-Type: application/json' -d '{"name": "Read", "target_per_week": 5, "unit": "pages"}'
+curl -X POST localhost:8000/habits/<habit_id>/checkins -H 'Content-Type: application/json' -d '{"value": 20}'
 curl -X POST localhost:8000/contacts -H 'Content-Type: application/json' \
   -d '{"name": "Jane Doe", "relationship": "friend", "dietary_tags": ["gluten_free"], "vault_path": "people/jane-doe.md"}'
 curl -X POST localhost:8000/notes -H 'Content-Type: application/json' -d '{"body": "Call the plumber", "tags": ["home"], "source": "chat"}'
@@ -421,6 +439,8 @@ Every tool starts with a marker saying whether it changes data. Read tools begin
 | `create_schedule_event`, `update_schedule_event`, `delete_schedule_event` | `POST`/`PATCH`/`DELETE /schedule` | change the calendar. Created events get `source: "mcp"`. |
 | `list_habits`, `get_habit` | `GET /habits`, `/habits/{id}` | habit definitions (use `get_context` with `include=["habits"]` for progress) |
 | `create_habit`, `update_habit`, `delete_habit` | `POST`/`PATCH`/`DELETE /habits` | `update_habit` with `active=false` retires a habit but keeps its history |
+| `list_habit_checkins` | `GET /habits/{id}/checkins` | the days a habit was done or skipped, optionally within `from_date`/`to_date` |
+| `create_habit_checkin`, `delete_habit_checkin` | `POST`/`DELETE /habits/{id}/checkins` | "I read 20 pages today". One per habit per day; delete a check-in to correct it. |
 | `list_contacts`, `get_contact` | `GET /contacts`, `/contacts/{id}` | people, with relationship, birthday and dietary needs |
 | `create_contact`, `update_contact`, `delete_contact` | `POST`/`PATCH`/`DELETE /contacts` | change contacts |
 | `list_notes`, `get_note` | `GET /notes`, `/notes/{id}` | short saved notes, which are separate from the vault |
@@ -430,7 +450,6 @@ Every tool starts with a marker saying whether it changes data. Read tools begin
 - **Updates:** update tools are partial, so only the fields you pass change. List field names in `clear` to erase them.
 - **Lists:** list tools return `{"count": n, "items": [...]}`, paged with `limit` and `offset`.
 - **Ids:** ids must be UUIDs, and anything else is rejected before the API is called.
-- **Not wrapped:** habit check-ins have no API endpoints yet, so there are no check-in tools.
 
 ## Schema overview
 
@@ -448,13 +467,25 @@ All tables use UUID primary keys, and `created_at`/`updated_at` are maintained b
 
 ## Tests
 
-Unit tests (chunker, embedder, path filtering) run anywhere with plain `pytest`. Tests that need a database are skipped unless `TEST_DATABASE_URL` is set in the environment, not only in `.env`. Point it at a **throwaway** database, because the API tests truncate tables. Without it, the app is pointed at an unreachable address, so tests can never touch your real database.
+The test suite runs against a **local throwaway Postgres**, never your real database, because the tests truncate tables.
 
+**One-time setup** (no admin rights, Docker or WSL):
 ```bash
-pytest   # unit tests only; database tests are skipped
-# with docker compose running (it creates personal_api_test):
-TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/personal_api_test pytest
+python -m tests.testdb setup
 ```
+This downloads [micromamba](https://mamba.readthedocs.io/) and installs Postgres 16 and pgvector 0.8 from conda-forge into `.testdb/`, which is git-ignored and about 370 MB. conda-forge only builds pgvector for Windows against Postgres 16; Supabase runs 17, and nothing in the migrations differs between them. The server listens on `127.0.0.1:54329` only, with trust auth and fsync off.
+
+**Running the tests:**
+```bash
+pytest
+```
+- **Automatic start and stop:** `pytest` starts the test database if needed, applies every migration, runs all tests (99 at the time of writing, in about 7 seconds), and stops the database again if it started it.
+- **Manual control:** `python -m tests.testdb start|stop|status|reset`. `reset` wipes the test data folder.
+- **Another throwaway database:** set `TEST_DATABASE_URL` in the environment.
+- **Safety check:** URLs that point at Supabase, or equal `DATABASE_URL` in `.env`, are refused.
+- **No test database at all:** DB tests are skipped, and the app is pointed at an unreachable address so nothing can reach your real data.
+
+On other platforms, `docker compose up -d` gives an equivalent database; set `TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/personal_api_test`.
 
 ## Running on Hermes (always-on)
 
